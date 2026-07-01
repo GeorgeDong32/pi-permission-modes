@@ -1,5 +1,5 @@
 {
-  "name": "@aprimediet/permission-modes",
+  "name": "@georgedong32/permission-modes",
   "version": "1.1.5",
   "type": "module",
   "description": "Claude-Code-style permission modes (ask / plan / auto) for the pi coding agent — with per-mode model profiles, outside-cwd write tracking, and per-mode skill filtering.",
@@ -7,12 +7,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aprimediet/pi-permission-modes.git"
+    "url": "git+https://github.com/GeorgeDong32/pi-permission-modes.git"
   },
   "bugs": {
-    "url": "https://github.com/aprimediet/pi-permission-modes/issues"
+    "url": "https://github.com/GeorgeDong32/pi-permission-modes/issues"
   },
-  "homepage": "https://github.com/aprimediet/pi-permission-modes#readme",
+  "homepage": "https://github.com/GeorgeDong32/pi-permission-modes#readme",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"

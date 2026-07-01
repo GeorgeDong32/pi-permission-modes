@@ -4,7 +4,7 @@ Guide for coding agents working in this repository. Product context (goals, user
 features, success metrics): see [docs/PRD.md](docs/PRD.md).
 
 ## Summary
-A pi extension that implements Claude-Code-style permission modes (ask / plan / auto) for the pi coding agent, published on npm as `@aprimediet/permission-modes@1.1.4`. It intercepts tool calls, gates approvals per mode, injects mode-specific context, provides a live footer + status pill, guards reads outside cwd in ask mode, supports auto-mode follow-up bounded by `/auto-depth`, auto-switches the model per mode when the user has defined profiles in `~/.pi/agent/model-profiles.json`, tracks outside-cwd writes for undo (v1.1.3+), and (v1.1.4+) supports per-mode skill filtering to keep the system prompt lean and mode-relevant.
+A pi extension that implements Claude-Code-style permission modes (ask / plan / auto) for the pi coding agent, published on npm as `@georgedong32/permission-modes@1.1.5`. It intercepts tool calls, gates approvals per mode, injects mode-specific context, provides a live footer + status pill, guards reads outside cwd in ask mode, supports auto-mode follow-up bounded by `/auto-depth`, auto-switches the model per mode when the user has defined profiles in `~/.pi/agent/model-profiles.json`, tracks outside-cwd writes for undo (v1.1.3+), and (v1.1.4+) supports per-mode skill filtering to keep the system prompt lean and mode-relevant.
 
 ## Tech Stack
 - **Language:** TypeScript (ESM — `"type": "module"`)
@@ -15,7 +15,7 @@ A pi extension that implements Claude-Code-style permission modes (ask / plan / 
 
 ## Project Structure
 ```
-permission-modes/             # @aprimediet/permission-modes
+permission-modes/             # @georgedong32/permission-modes
 ├── package.json              # pi manifest + npm package metadata
 ├── index.ts                  # main extension — default-exported factory function
 ├── profiles.ts               # model-profile config helpers (load, resolve, parse)
@@ -98,7 +98,7 @@ permission-modes/             # @aprimediet/permission-modes
 - The `modelsPath` export is mutable via `setModelsPath(p)` to allow tests to redirect to a tmpdir fixture. Don't rely on assignment to the exported binding directly (ESM forbids it).
 - No `.env` / `.env.example` — this extension has no environment secrets.
 - No `tsconfig.json` — pi bundles its own TypeScript configuration.
-- **Registry indexing lag:** `npm view` can return stale data for a few minutes after publish. Verify via direct GET to `https://registry.npmjs.org/@aprimediet/permission-modes/<version>`.
+- **Registry indexing lag:** `npm view` can return stale data for a few minutes after publish. Verify via direct GET to `https://registry.npmjs.org/@georgedong32/permission-modes/<version>`.
 - **No git tags yet:** tag the release on GitHub with `git tag v<version> && git push origin v<version>`.
 
 ## Companion Extensions

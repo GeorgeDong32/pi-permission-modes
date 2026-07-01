@@ -1,7 +1,7 @@
-# @aprimediet/permission-modes
+# @georgedong32/permission-modes
 
-[![npm version](https://img.shields.io/npm/v/@aprimediet/permission-modes)](https://www.npmjs.com/package/@aprimediet/permission-modes)
-[![License](https://img.shields.io/npm/l/@aprimediet/permission-modes)](LICENSE)
+[![npm version](https://img.shields.io/npm/v/@georgedong32/permission-modes)](https://www.npmjs.com/package/@georgedong32/permission-modes)
+[![License](https://img.shields.io/npm/l/@georgedong32/permission-modes)](LICENSE)
 
 Claude-Code-style **permission modes** for the [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent). Three modes, cycled with **Shift+Tab**, that control how tool calls and file edits get approved. v1.1.1 adds **per-mode model profiles**. v1.1.3 adds **outside-cwd write tracking** with `/undo-outside-writes`. v1.1.4 adds **per-mode skill filtering** — keep your system prompt lean and focused on the current mode.
 
@@ -117,7 +117,7 @@ Current mode, the auto-follow-up depth, and the active profile name **persist** 
 
 ```bash
 # Install as a package (scoped npm name; or from a git remote / local path)
-pi install npm:@aprimediet/permission-modes
+pi install npm:@georgedong32/permission-modes
 pi list                                            # verify it loaded
 
 # Or run it directly for a quick try (no install)
@@ -143,7 +143,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 ## Layout
 
 ```
-permission-modes/             # @aprimediet/permission-modes
+permission-modes/             # @georgedong32/permission-modes
 ├── package.json              # pi manifest + npm package metadata
 ├── index.ts                  # main extension (default-exported factory)
 ├── profiles.ts               # NEW in v1.1.1: model-profile config helpers

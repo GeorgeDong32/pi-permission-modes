@@ -64,8 +64,8 @@ const MODE_CYCLE: Mode[] = ["ask", "plan", "auto"];
 
 const MODE_META: Record<Mode, { icon: string; label: string; role: string }> = {
   ask: { icon: "●", label: "Ask", role: "muted" },
-  plan: { icon: "⏸", label: "Plan", role: "warning" },
-  auto: { icon: "▶", label: "Auto", role: "accent" },
+  plan: { icon: "⏸", label: "Plan", role: "accent" },
+  auto: { icon: "▶", label: "Auto", role: "warning" },
 };
 
 // Tools available in plan mode (edit/write are stripped).
@@ -268,8 +268,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   // ---- UI: status, footer, plan widget, working stats --------------------
   function updateStatus(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
+    ctx.ui.setStatus("modes", undefined);
     const m = MODE_META[currentMode];
-    ctx.ui.setStatus("modes", ctx.ui.theme.fg(m.role, `${m.icon} ${m.label}`));
     ctx.ui.setWorkingIndicator({
       frames: [ctx.ui.theme.fg(m.role, "●")],
       intervalMs: 500,
@@ -281,56 +281,89 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     return p && p.startsWith(home) ? `~${p.slice(home.length)}` : p;
   }
 
-  function layoutThree(
-    left: string,
-    center: string,
-    right: string,
-    width: number,
-  ): string {
-    const lw = visibleWidth(left);
-    const cw = visibleWidth(center);
-    const rw = visibleWidth(right);
-    if (lw + cw + rw + 2 <= width) {
-      const leftGap = Math.max(1, Math.floor((width - cw) / 2) - lw);
-      const rightGap = Math.max(1, width - lw - leftGap - cw - rw);
-      return left + " ".repeat(leftGap) + center + " ".repeat(rightGap) + right;
-    }
-    const gap = Math.max(1, width - lw - rw);
-    return truncateToWidth(left + " ".repeat(gap) + right, width);
-  }
-
   function installFooter(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
     ctx.ui.setFooter((_tui: any, theme: any) => ({
       render(width: number): string[] {
         const m = MODE_META[currentMode];
-        const left = theme.fg(
-          m.role,
-          `${m.icon} ${m.label} (shift+tab to cycle)`,
-        );
         const cwd = shortenPath(ctx.cwd);
-        const center = theme.fg(
-          "muted",
-          gitBranch ? `${cwd} [${gitBranch}]` : cwd,
-        );
+        const cwdText = gitBranch ? `${cwd} (${gitBranch})` : cwd;
+
+        const ctxUsage = (ctx as any).getContextUsage?.();
+        let ctxStr = "";
+        if (ctxUsage && ctxUsage.tokens != null && ctxUsage.percent != null) {
+          const fmtK = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}k`;
+          ctxStr = `${fmtK(ctxUsage.tokens)}/${fmtK(ctxUsage.contextWindow)} ${ctxUsage.percent.toFixed(1)}%`;
+        }
+
         const md = (ctx as any).model;
         let modelStr = "";
         if (md) {
-          // variant = the model's display name (fall back to the id if no name)
           modelStr = md.name ? String(md.name) : String(md.id ?? "");
-          // thinking = current thinking/reasoning level (off|minimal|low|medium|high|xhigh)
           const thinking =
             typeof (pi as any).getThinkingLevel === "function"
               ? (pi as any).getThinkingLevel()
               : undefined;
-          if (thinking) modelStr += ` / ${thinking}`;
+          if (thinking) modelStr += ` • ${thinking}`;
         }
-        // Prepend profile prefix when a model profile is active.
         if (activeProfile) {
           modelStr = `profile:${activeProfile} · ${modelStr}`;
         }
-        const right = theme.fg("dim", modelStr);
-        return [layoutThree(left, center, right, width)];
+
+        const cwdW = visibleWidth(cwdText);
+        const ctxW = visibleWidth(ctxStr);
+        const modelW = visibleWidth(modelStr);
+        const modeText = `${m.icon} ${m.label} (shift+tab)`;
+        const modeW = visibleWidth(modeText);
+
+        // Wide: line1 = cwd(L) + context(centered) + model(R), line2 = mode
+        if (cwdW + ctxW + modelW + 4 <= width) {
+          const leftGap = Math.max(2, Math.floor((width - ctxW) / 2) - cwdW);
+          const rightGap = width - cwdW - leftGap - ctxW - modelW;
+          if (rightGap >= 12) {
+            const line1 =
+              theme.fg("muted", cwdText) +
+              " ".repeat(leftGap) +
+              theme.fg("dim", ctxStr) +
+              " ".repeat(rightGap) +
+              theme.fg("dim", modelStr);
+            const line2 = theme.fg(m.role, modeText);
+            return [line1, line2];
+          }
+        }
+
+        // Narrow: line1 = cwd(L) + context(R), line2 = mode(L) + model(R)
+        // Pre-truncate plain text to guarantee fit
+        let cwdDisp = cwdText;
+        let cwdDispW = cwdW;
+        let ctxDisp = ctxStr;
+        let ctxDispW = ctxW;
+        if (cwdW + ctxW + 1 > width) {
+          // cwd too long, truncate it
+          cwdDisp = truncateToWidth(cwdText, Math.max(4, width - ctxW - 1));
+          cwdDispW = visibleWidth(cwdDisp);
+        }
+        const gap1 = Math.max(1, width - cwdDispW - ctxDispW);
+        const line1 =
+          theme.fg("muted", cwdDisp) +
+          " ".repeat(gap1) +
+          theme.fg("dim", ctxDisp);
+
+        let modeDisp = modeText;
+        let modeDispW = modeW;
+        let modelDisp = modelStr;
+        let modelDispW = modelW;
+        if (modeW + modelW + 1 > width) {
+          modelDisp = truncateToWidth(modelStr, Math.max(4, width - modeW - 1));
+          modelDispW = visibleWidth(modelDisp);
+        }
+        const gap2 = Math.max(1, width - modeDispW - modelDispW);
+        const line2 =
+          theme.fg(m.role, modeDisp) +
+          " ".repeat(gap2) +
+          theme.fg("dim", modelDisp);
+
+        return [line1, line2];
       },
       invalidate() {},
     }));
@@ -383,8 +416,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     if (lastTps > 0) parts.push(`⚡${Math.round(lastTps)} tok/s`);
     parts.push(`$${s.cost.toFixed(3)}`);
     const usage = (ctx as any).getContextUsage?.();
-    if (usage && usage.maxTokens) {
-      parts.push(`${Math.round((usage.tokens / usage.maxTokens) * 100)}% ctx`);
+    if (usage && usage.percent != null) {
+      parts.push(`${Math.round(usage.percent)}% ctx`);
     }
     return `Working… (${parts.join(" · ")})`;
   }
