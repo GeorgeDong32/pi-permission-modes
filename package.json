@@ -1,9 +1,11 @@
 {
   "name": "@georgedong32/permission-modes",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "type": "module",
   "description": "Claude-Code-style permission modes (ask / plan / auto) for the pi coding agent — with per-mode model profiles, outside-cwd write tracking, and per-mode skill filtering.",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -24,9 +26,15 @@
     "pack:dry": "npm pack --dry-run"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
-  "files": ["*.ts", "README.md", "LICENSE"],
+  "files": [
+    "*.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",
