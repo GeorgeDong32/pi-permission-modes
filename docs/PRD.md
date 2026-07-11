@@ -13,7 +13,7 @@ The pi coding agent lacks granular permission controls during a session. Users w
 ## Goals
 - Provide three distinct permission modes that control how tool calls (edit, write, bash) are approved
 - Let users cycle modes easily via Shift+Tab keyboard shortcut
-- Show the current mode in the UI via a status pill and custom footer
+- Show the current mode in the UI via a custom adaptive footer (v1.1.6: context usage + two-line layout)
 - Persist the current mode and auto-follow-up depth across session restarts
 - In Plan mode: restrict to read-only exploration, produce a structured plan, then optionally execute it step by step with [DONE:n] tracking
 - Optionally swap the AI model per mode via user-defined model profiles stored at `~/.pi/agent/model-profiles.json`
@@ -44,7 +44,7 @@ Users define named profiles in `~/.pi/agent/model-profiles.json` mapping each mo
 Auto mode now auto-approves `edit`/`write` outside the working directory but snapshots each one to `<cwd>/.pi/projects/<id>/tmp/outside-writes/` for potential rollback. Use `/undo-outside-writes` to restore or `/outside-writes` to list tracked writes. The snapshot captures the file's pre-write content (or `null` if the file didn't exist). Snapshots are capped at 100 entries (LRU eviction).
 
 ### UI Integration
-A status pill shows the current mode with color-coded role (muted/warning/success/accent). A custom footer displays mode · current-working-directory [git-branch] · model/thinking-level (or `profile:name · model/thinking-level` when a profile is active). During execution, live token stats and context usage are shown.
+An adaptive custom footer (v1.1.6) shows cwd [git-branch], context usage (`tokens/contextWindow percent`), and model/thinking-level (or `profile:name · model/thinking-level` when a profile is active). Wide terminals use a two-line layout (info row + mode row); narrow terminals reflow with truncation. Mode is color-coded (ask=muted, plan=accent, auto=warning). The colored status pill was removed in v1.1.6. During execution, live token stats and context usage are shown in the working indicator.
 
 ### Keybinding
 Shift+Tab cycles permission modes; Alt+T cycles the thinking level (off → minimal → low → medium → high → xhigh). Both are custom keybindings that integrate with pi's shortcut system.
@@ -55,7 +55,7 @@ The current mode, auto-mode follow-up depth cap, and active profile name are per
 ## Success Metrics
 - Users can switch modes as easily as they do in Claude Code
 - No friction switching between exploratory (plan) and autonomous (auto) workflows
-- The status pill and footer always reflect the correct current mode
+- The footer always reflects the correct current mode, profile, and context usage
 
 ## Scope & Boundaries
 - **In scope:** A pi extension that intercepts `tool_call` events to gate approvals, injects mode-specific context into the agent loop, and provides UI feedback via pi's extension API

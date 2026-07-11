@@ -1,3 +1,48 @@
+## [2.0.0] - 2026-07-11
+
+### Added
+- **Fourth mode: `bypass`** — full auto-approve (v1.1.6 auto semantics). Cycle is now `ask → plan → auto → bypass → ask` (Shift+Tab). Sparse security reminder on mode switch and after `session_compact`.
+- **Built-in auto classifier** (`classifier-client.ts` + `classifier-providers/`): optional LLM review for tier-3 tool calls. Uses `ctx.modelRegistry.getApiKeyAndHeaders()` only — **does not import `@earendil-works/pi-ai`**. Supports `anthropic-messages`, `openai-responses`, and `openai-completions`. Config: `~/.pi/agent/permission-modes.json` (`classifier.enabled` defaults to `false`).
+- **Plan file driver**: plan content lives at `<cwd>/.pi/projects/<projectId>/plan.md`; injection is path-only. Plan mode allows `edit`/`write` on that file only.
+- **System prompt anchor injection** (`<!-- permission-modes:context -->`) replaces per-turn `modes-context` messages.
+- **`AUTO_RISK_PATTERNS` blacklist** as permanent auto-mode fallback when classifier is off or fails.
+
+### Changed
+- **Breaking: `auto` semantics** — tiered auto-approve (read → cwd writes → classifier/blacklist for risky ops). Old full-auto behavior is **`bypass`**.
+- **Breaking: removed `/auto-depth`** and per-turn `"Continue..."` synthetic follow-ups.
+- **Ask "Allow all"** now switches to **bypass** (not auto).
+- **`profiles.ts`**: `bypass` mode supported in model profiles.
+
+### Removed
+- `modes-context` injection on every turn (legacy `context` dedup hook retained for old sessions).
+
+### Notes
+- Total tests: **201 passing**.
+- Migration: sessions restored with `currentMode: "auto"` get the **new** auto (not full bypass). Use `/bypass` for unrestricted auto-approve.
+
+[2.0.0]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v1.1.6...v2.0.0
+
+## [1.1.6] - 2026-07-01
+
+### Added
+- **Adaptive footer layout**: Wide terminals show cwd (left) · context usage (center) · model/profile (right) on line 1, mode on line 2. Narrow terminals reflow to cwd + context on line 1, mode + model on line 2, with truncation to prevent overflow.
+- **Context usage in footer**: Displays `tokens/contextWindow percent` via `ctx.getContextUsage()` (e.g. `42k/200k 21.0%`). Large counts use an `M` suffix (e.g. `1.0M`).
+
+### Fixed
+- **Narrow-terminal crash**: Footer layout no longer computes negative gaps when the terminal is too narrow — pre-truncates text and uses `Math.max(1, …)` for spacing.
+
+### Changed
+- **Removed colored status pill**: `ctx.ui.setStatus("modes", undefined)` — mode is shown only in the custom footer (working indicator `●` remains).
+- **Mode colors**: plan uses `accent`, auto uses `warning` (swapped from v1.1.5).
+- **npm scope**: Package renamed from `@aprimediet/permission-modes` to `@georgedong32/permission-modes`. Old scope remains on npm as a separate line; new installs should use `@georgedong32/permission-modes`.
+- **`package.json`**: Added `repository`, `bugs`, `homepage`, and `publishConfig` metadata.
+
+### Notes
+- Total tests: **189 passing** (unchanged from v1.1.5).
+- Git tag: `v1.1.6`.
+
+[1.1.6]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v1.1.5...v1.1.6
+
 ## [1.1.5] - 2026-06-29
 
 ### Fixed
@@ -19,7 +64,7 @@
 - Manual verification on the current session: with `~/.pi/agent/model-profiles.json` `default.plan.skills = ["brainstorming","using-superpowers","writing-plans"]`, the v1.1.5 regex correctly reduces 21 → 3 `<skill>` blocks.
 - This is a behavior-changing fix to a feature that was effectively missing in v1.1.4. Bumped to v1.1.5 (minor) rather than v1.1.4 patch.
 
-[1.1.5]: https://github.com/aprimediet/pi-permission-modes/compare/v1.1.4...v1.1.5
+[1.1.5]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v1.1.4...v1.1.5
 
 ## [1.1.4] - 2026-06-29
 

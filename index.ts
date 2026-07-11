@@ -1,22 +1,13 @@
 /**
- * @aprimediet/permission-modes
+ * @georgedong32/permission-modes
  *
- * A Claude-Code-style permission-mode system for the pi coding agent.
+ * Claude-Code-style permission modes for the pi coding agent.
  *
- * Three modes, cycled with Shift+Tab (ask → plan → auto → ask):
- *   - ask          File edits/writes require approval; reads outside cwd require
- *                  approval; inside-cwd reads are auto-approved; mutating bash prompts.
- *   - plan         Read-only; edit/write disabled, bash restricted to an allowlist;
- *                  produce a numbered Plan:, then Execute / Stay / Refine.
- *   - auto         Auto-approve everything and auto-continue (bounded by /auto-depth)
- *                  with an outside-cwd safety net (prompt on ops outside project root).
- *
- * v1.1.1 adds per-mode model profiles: users define named profiles in
- * `~/.pi/agent/model-profiles.json` mapping each mode to a model ID. When
- * the mode changes, the extension auto-switches the model via
- * `pi.setModel()`. The `/model-profile` command and `--model-profile` flag
- * activate profiles on the fly. The footer shows `profile:<name> ·
- * model/thinking` when a profile is active.
+ * Four modes (Shift+Tab): ask → plan → auto → bypass → ask
+ *   - ask     Manual approval for edits, outside-cwd access, mutating bash.
+ *   - plan    Read-only; only plan.md may be written.
+ *   - auto    Tiered auto-approve + optional built-in classifier + risk blacklist.
+ *   - bypass  Full auto-approve (old auto semantics); sparse security reminders.
  */
 
 import type {
@@ -26,22 +17,40 @@ import type {
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os";
+import path from "node:path";
+import { classifyToolCall } from "./classifier-client.ts";
 import {
-  commandTargetsOutsideCwd,
+  loadPermissionModesConfig,
+  resolveClassifierConfig,
+} from "./config.ts";
+import {
+  checkAutoRisk,
+  ensurePlanFile,
+  extractPlanSection,
   extractTodoItems,
   filterSkillsFromPrompt,
+  filterSubstantivePlanItems,
   findProjectRoot,
   formatCount,
-  isCompletionSignal,
-  isInsideProject,
+  getPlanFilePath,
+  hashPlan,
+  injectModePrompt,
   isOutsideCwd,
+  isPlanFilePath,
   isSafeCommand,
   listTrackedOutsideWrites,
   markCompletedSteps,
   popTrackedOutsideWrite,
+  readPlanFile,
+  resolveModePrompt,
+  resolveWorkspacePath,
   restoreOutsideWrite,
+  shouldSyncAssistantPlanToFile,
   trackOutsideWrite,
+  writePlanFile,
   type OutsideWriteSnapshot,
+  type PermissionMode,
+  type PlanPhase,
   type TodoItem,
 } from "./utils.ts";
 import {
@@ -57,50 +66,37 @@ import {
   type ModelProfilesConfig,
 } from "./profiles.ts";
 
-type Mode = "ask" | "plan" | "auto";
+type Mode = PermissionMode;
 
-// accept-edits removed, default renamed to ask in v2.0.0.
-const MODE_CYCLE: Mode[] = ["ask", "plan", "auto"];
+const MODE_CYCLE: Mode[] = ["ask", "plan", "auto", "bypass"];
 
 const MODE_META: Record<Mode, { icon: string; label: string; role: string }> = {
   ask: { icon: "●", label: "Ask", role: "muted" },
   plan: { icon: "⏸", label: "Plan", role: "accent" },
   auto: { icon: "▶", label: "Auto", role: "warning" },
+  bypass: { icon: "⚡", label: "Bypass", role: "error" },
 };
 
-// Tools available in plan mode (edit/write are stripped).
-const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls"];
-const PLAN_DISABLED = new Set(["edit", "write"]);
-
-const MODE_CONTEXT: Record<Mode, string> = {
-  ask:
-    "[ASK MODE] Default permission mode. File edits/writes and access outside the working directory require explicit approval before they run. Mutating shell commands require approval. Read-only access inside the working directory is auto-approved.",
-  plan: `[PLAN MODE ACTIVE]
-You are in a read-only exploration mode. The edit and write tools are disabled and bash is restricted to read-only commands.
-
-Investigate as needed, then produce a detailed, numbered plan under a "Plan:" header:
-
-Plan:
-1. First step
-2. Second step
-...
-
-Do NOT make any changes — only describe what you would do.`,
-  auto: "[AUTO MODE ACTIVE] All tool calls are auto-approved. Work autonomously without asking for permission until the task is complete. When you write or edit files outside the working directory, the change is automatically tracked (snapshotted) so the user can roll it back with /undo-outside-writes if needed. When everything is done, say the task is complete.",
-};
+// Tools available in plan mode (edit/write only for plan.md via tool_call gate).
+const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls", "edit", "write"];
+const PLAN_DISABLED = new Set<string>();
 
 type Block = { block: true; reason: string } | undefined;
 
 export default function permissionModesExtension(pi: ExtensionAPI): void {
   // ---- state -------------------------------------------------------------
   let currentMode: Mode = "ask";
-  let autoFollowUpDepth = 20;
-  let autoFollowUpCount = 0;
-  let isStepping = false;
-  let toolsBeforePlanMode: string[] | undefined;
   let planExecuting = false;
+  let planPhase: PlanPhase = "exploring";
+  let lastExtractedPlanHash = "";
+  let needsAskReminder = false;
+  let needsBypassSecurityReminder = false;
+  let pendingComplianceInject = false;
+  let complianceCategory = "";
+  let toolsBeforePlanMode: string[] | undefined;
   let planTodos: TodoItem[] = [];
   let projectRoot: string | null = null;
+  let classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
 
   // ---- model-profile state -----------------------------------------------
   // activeProfile === undefined means "no profile active" — the extension
@@ -130,26 +126,153 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         ? m.content
         : "";
 
-  const hasToolCalls = (m: any): boolean =>
-    Array.isArray(m?.content) &&
-    m.content.some(
-      (c: any) =>
-        c &&
-        (c.type === "toolCall" ||
-          c.type === "tool_call" ||
-          c.type === "toolUse"),
-    );
-
   function persistState(): void {
     pi.appendEntry("modes", {
       currentMode,
-      autoFollowUpDepth,
       activeProfile,
+      planPhase,
+      planExecuting,
+      planTodos,
+      lastExtractedPlanHash,
     });
+  }
+
+  function blockAutoTier3(
+    reason: string,
+    category: string,
+  ): Block {
+    pendingComplianceInject = true;
+    complianceCategory = category;
+    return { block: true, reason };
+  }
+
+  async function approveAutoTier3(
+    ctx: ExtensionContext,
+    tool: string,
+    input: Record<string, unknown>,
+    riskInput: {
+      tool: string;
+      command?: string;
+      path?: string;
+    },
+  ): Promise<Block> {
+    const risk = checkAutoRisk(riskInput, ctx.cwd);
+    if (risk.match) {
+      return blockAutoTier3(risk.reason, risk.category);
+    }
+
+    let classifierAllowed = false;
+    if (classifierConfig.enabled) {
+      try {
+        const verdict = await classifyToolCall({
+          modelRef: classifierConfig.model,
+          userMessages: collectRecentUserMessages(ctx),
+          pendingTool: { name: tool, input },
+          registry: ctx.modelRegistry as any,
+          timeoutMs: classifierConfig.timeoutMs,
+        });
+        if (!verdict.allow) {
+          return blockAutoTier3(
+            verdict.reason || "Blocked by auto classifier",
+            "classifier",
+          );
+        }
+        classifierAllowed = true;
+      } catch (err) {
+        console.warn(
+          "[permission-modes] Classifier failed, falling back to blacklist:",
+          err,
+        );
+      }
+    }
+
+    if (!classifierAllowed) {
+      const isKnownTier3 =
+        tool === "bash" || tool === "edit" || tool === "write";
+      if (!isKnownTier3) {
+        return blockAutoTier3(
+          `Tool "${tool}" is not auto-approved in auto mode. Enable classifier or switch to bypass.`,
+          "unknown-tool",
+        );
+      }
+      if (tool === "bash") {
+        const cmd = String(input.command ?? "");
+        if (cmd && !isSafeCommand(cmd)) {
+          return blockAutoTier3(
+            `Mutating bash blocked in auto mode: ${cmd}`,
+            "mutating-bash",
+          );
+        }
+      }
+    }
+
+    if (tool === "edit" || tool === "write") {
+      trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+    }
+    return undefined;
+  }
+
+  function trackOutsideWriteIfNeeded(
+    ctx: ExtensionContext,
+    tool: "edit" | "write",
+    pathStr: string,
+  ): void {
+    if (!pathStr || !isOutsideCwd(pathStr, ctx.cwd)) return;
+    const resolvedPath = resolveWorkspacePath(pathStr, ctx.cwd);
+    let backupContent: string | null = null;
+    try {
+      backupContent = readFileSync(resolvedPath, "utf-8");
+    } catch {
+      backupContent = null;
+    }
+    trackOutsideWrite(ctx.cwd, {
+      timestamp: new Date().toISOString(),
+      originalPath: resolvedPath,
+      toolName: tool,
+      backupContent,
+    });
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `📝 tracked outside-cwd ${tool}: ${shortenPath(resolvedPath)}`,
+        "info",
+      );
+    }
+  }
+
+  function collectRecentUserMessages(ctx: ExtensionContext): string[] {
+    try {
+      const branch = (ctx.sessionManager as any).getBranch?.() ?? [];
+      const texts: string[] = [];
+      for (const entry of branch) {
+        if (entry?.type !== "message") continue;
+        const msg = entry.message;
+        if (msg?.role !== "user") continue;
+        if (typeof msg.content === "string" && msg.content.trim()) {
+          texts.push(msg.content.trim());
+        } else if (Array.isArray(msg.content)) {
+          const t = msg.content
+            .filter((c: any) => c?.type === "text")
+            .map((c: any) => c.text)
+            .join("\n")
+            .trim();
+          if (t) texts.push(t);
+        }
+      }
+      return texts;
+    } catch {
+      return [];
+    }
   }
 
   // ---- tool gating -------------------------------------------------------
   function applyToolRestrictions(): void {
+    if (planExecuting) {
+      if (toolsBeforePlanMode !== undefined) {
+        pi.setActiveTools(toolsBeforePlanMode);
+        toolsBeforePlanMode = undefined;
+      }
+      return;
+    }
     if (currentMode === "plan") {
       if (toolsBeforePlanMode === undefined)
         toolsBeforePlanMode = pi.getActiveTools();
@@ -163,13 +286,26 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
   // ---- mode switching ----------------------------------------------------
   async function setMode(mode: Mode, ctx: ExtensionContext): Promise<void> {
+    const prev = currentMode;
     currentMode = mode;
-    autoFollowUpCount = 0;
-    isStepping = false;
-    // A manual switch always cancels any in-flight plan execution.
+    needsAskReminder = mode === "ask";
+    needsBypassSecurityReminder = mode === "bypass";
+    pendingComplianceInject = false;
+    complianceCategory = "";
     planExecuting = false;
+
+    if (mode !== "plan") {
+      planPhase = "exploring";
+      lastExtractedPlanHash = "";
+    }
+    if (mode === "plan") {
+      ensurePlanFile(ctx.cwd);
+      if (prev !== "plan") planPhase = "exploring";
+    }
+
     planTodos = [];
     if (ctx.hasUI) ctx.ui.setWidget("plan-todos", undefined);
+
     applyToolRestrictions();
     updateStatus(ctx);
     await applyProfileModelForMode(mode, ctx);
@@ -450,7 +586,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   }
 
   // ---- commands / shortcut / flag ---------------------------------------
-  for (const mode of ["ask", "plan", "auto"] as Mode[]) {
+  for (const mode of ["ask", "plan", "auto", "bypass"] as Mode[]) {
     pi.registerCommand(mode, {
       description: `Switch to ${MODE_META[mode].label} mode`,
       handler: async (_args, ctx) => setMode(mode, ctx),
@@ -459,7 +595,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
   pi.registerCommand("mode", {
     description:
-      "Show or set the permission mode (ask | plan | auto)",
+      "Show or set the permission mode (ask | plan | auto | bypass)",
     handler: async (args, ctx) => {
       const arg = (args ?? "").trim();
       if (arg && (MODE_CYCLE as string[]).includes(arg)) {
@@ -478,24 +614,6 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       );
       const picked = MODE_CYCLE.find((m) => MODE_META[m].label === choice);
       if (picked) await setMode(picked, ctx);
-    },
-  });
-
-  pi.registerCommand("auto-depth", {
-    description: "Set auto-mode follow-up depth cap (0 = unlimited)",
-    handler: async (args, ctx) => {
-      const n = parseInt((args ?? "").trim(), 10);
-      if (!Number.isNaN(n) && n >= 0) {
-        autoFollowUpDepth = n;
-        persistState();
-        if (ctx.hasUI)
-          ctx.ui.notify(`Auto follow-up depth: ${n === 0 ? "unlimited" : n}`);
-      } else if (ctx.hasUI) {
-        ctx.ui.notify(
-          `Auto follow-up depth: ${autoFollowUpDepth === 0 ? "unlimited" : autoFollowUpDepth}`,
-          "info",
-        );
-      }
     },
   });
 
@@ -540,7 +658,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         const activeName = getActiveProfileName(config);
         const lines = names.map((n) => {
           const p = config[n] as ModelProfile;
-          const mappings = ["ask", "plan", "auto"]
+          const mappings = ["ask", "plan", "auto", "bypass"]
             .map((m) => `${m}:${(p as any)[m] || "-"}`)
             .join(" ");
           const active = n === activeName ? " (active)" : "";
@@ -709,7 +827,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
 
     pi.registerShortcut("shift+tab", {
-    description: "Cycle mode: Ask → Plan → Auto",
+    description: "Cycle mode: Ask → Plan → Auto → Bypass",
     handler: async (ctx) => cycleMode(ctx),
   });
 
@@ -762,7 +880,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   // Mirrors Shift+Tab's cycle-by-one behavior: starts at the profile after the
   // currently active one and wraps. Falls back to the first profile when no
   // profile is active yet. Always re-applies the model for the current mode,
-  // so the UI (footer + status pill) updates immediately.
+  // so the UI (footer) updates immediately.
   async function cycleProfile(ctx: ExtensionContext): Promise<void> {
     const config = loadModelProfiles();
     const names = listProfiles(config);
@@ -795,7 +913,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   // flag must use a distinct name to avoid being shadowed at parse time.
   pi.registerFlag("permission-mode", {
     description:
-      "Start in a permission mode: ask, plan, or auto (accepts 'default' as alias for 'ask')",
+      "Start in a permission mode: ask, plan, auto, or bypass (accepts 'default' as alias for 'ask')",
     type: "string",
     default: "ask",
   });
@@ -810,14 +928,34 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   pi.on("tool_call", async (event, ctx): Promise<Block> => {
     const tool = event.toolName;
     const input = (event.input ?? {}) as Record<string, unknown>;
+    const planFilePath = getPlanFilePath(ctx.cwd);
 
-    // PLAN: edit/write already stripped via setActiveTools; defensive block in case
-    // the tool still reaches us (e.g., during the same turn before activeTools is updated).
+    // BYPASS: approve everything; still track outside-cwd writes for undo.
+    if (currentMode === "bypass") {
+      if (tool === "edit" || tool === "write") {
+        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+      }
+      return undefined;
+    }
+
+    // PLAN EXECUTION: full tool access (legacy EXECUTING PLAN semantics).
+    if (planExecuting) {
+      if (tool === "edit" || tool === "write") {
+        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+      }
+      return undefined;
+    }
+
+    // PLAN: read-only except plan.md; bash allowlist only.
     if (currentMode === "plan") {
       if (tool === "edit" || tool === "write") {
+        const pathStr = String(input.path ?? "");
+        if (pathStr && isPlanFilePath(pathStr, ctx.cwd)) {
+          return undefined;
+        }
         return {
           block: true,
-          reason: `Plan mode: edit/write disabled. Use /plan to exit plan mode first.`,
+          reason: `Plan mode: only ${shortenPath(planFilePath)} may be edited.`,
         };
       }
       if (tool === "bash") {
@@ -825,62 +963,38 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         if (!isSafeCommand(cmd)) {
           return {
             block: true,
-            reason: `Plan mode: read-only commands only. Use /plan to exit plan mode first.\n  Command: ${cmd}`,
+            reason: `Plan mode: read-only commands only.\n  Command: ${cmd}`,
           };
         }
       }
       return undefined;
     }
 
-    // AUTO: approve everything, except prompt for bash destructive outside cwd
-    // that targets paths outside the detected project root. Reads are always
-    // auto-approved (read-only). Edit/write outside cwd are auto-approved but
-    // tracked via trackOutsideWrite() so the user can roll back via
-    // /undo-outside-writes (NEW in v1.1.3).
+    // AUTO: tiered gate with blacklist + optional classifier
     if (currentMode === "auto") {
       if (tool === "read" || tool === "grep" || tool === "find" || tool === "ls") {
         return undefined;
       }
 
-      // Edit/write: auto-approve; track outside-cwd writes for undo.
       if (tool === "edit" || tool === "write") {
         const pathStr = String(input.path ?? "");
-        if (pathStr && isOutsideCwd(pathStr, ctx.cwd)) {
-          let backupContent: string | null = null;
-          try {
-            backupContent = readFileSync(pathStr, "utf-8");
-          } catch {
-            backupContent = null;
-          }
-          trackOutsideWrite(ctx.cwd, {
-            timestamp: new Date().toISOString(),
-            originalPath: pathStr,
-            toolName: tool,
-            backupContent,
-          });
-          if (ctx.hasUI) {
-            ctx.ui.notify(
-              `📝 tracked outside-cwd ${tool}: ${shortenPath(pathStr)}`,
-              "info",
-            );
-          }
+        if (!pathStr || !isOutsideCwd(pathStr, ctx.cwd)) {
+          return undefined;
         }
-        return undefined;
       }
 
-      // Bash: destructive outside cwd still prompts (safety net unchanged).
-      const cmdStr = String(input.command ?? "");
-      const outside = cmdStr && commandTargetsOutsideCwd(cmdStr, ctx.cwd);
-      if (outside && !isInsideProject(".", ctx.cwd, projectRoot)) {
-        return promptApproval(ctx, tool, `outside cwd on "${cmdStr}"`);
-      }
-      return undefined;
+      return approveAutoTier3(ctx, tool, input, {
+        tool,
+        command: tool === "bash" ? String(input.command ?? "") : undefined,
+        path:
+          tool === "edit" || tool === "write"
+            ? String(input.path ?? "")
+            : undefined,
+      });
     }
 
-    // ASK: prompt on edit/write (with "Allow all → auto"); prompt on read outside cwd;
-    // inside-cwd reads auto-approved; mutating bash prompts.
+    // ASK: prompt on edit/write; prompt on read outside cwd; mutating bash prompts.
     if (currentMode === "ask") {
-      // Read operations: prompt if outside cwd, auto-approve if inside cwd.
       if (tool === "read" || tool === "grep" || tool === "find" || tool === "ls") {
         const pathStr = String(input.path ?? "");
         if (pathStr && isOutsideCwd(pathStr, ctx.cwd)) {
@@ -889,23 +1003,23 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         return undefined;
       }
       if (tool === "edit" || tool === "write") {
-        const path = String(input.path ?? "(unknown)");
+        const pathVal = String(input.path ?? "(unknown)");
         if (!ctx.hasUI)
           return {
             block: true,
             reason: `${tool} blocked: no UI available to confirm.`,
           };
-        const choice = await ctx.ui.select(`Allow ${tool} on ${path}?`, [
+        const choice = await ctx.ui.select(`Allow ${tool} on ${pathVal}?`, [
           "Allow",
-          "Allow all (enable auto)",
+          "Allow all (enable bypass)",
           "Block",
         ]);
-        if (choice === "Allow all (enable auto)") {
-          await setMode("auto", ctx);
+        if (choice === "Allow all (enable bypass)") {
+          await setMode("bypass", ctx);
           return undefined;
         }
         if (choice !== "Allow")
-          return { block: true, reason: `${tool} blocked by user on ${path}` };
+          return { block: true, reason: `${tool} blocked by user on ${pathVal}` };
         return undefined;
       }
       if (tool === "bash") {
@@ -916,80 +1030,78 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       return undefined;
     }
 
-    // Fallback: unknown tool or mode — let through.
     return undefined;
   });
 
-  // ---- context injection + dedup ----------------------------------------
+  // ---- context injection (system prompt anchor) --------------------------
   pi.on("before_agent_start", async (event, ctx) => {
+    classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
+
+    const systemPromptBase =
+      event?.systemPrompt ?? ctx?.getSystemPrompt?.() ?? "";
+
+    let modeBlock = "";
+    const complianceBlock = pendingComplianceInject
+      ? resolveModePrompt({
+          mode: currentMode,
+          pendingComplianceInject: true,
+          complianceCategory,
+        })
+      : "";
+
     if (planExecuting && planTodos.length) {
       const remaining = planTodos
         .filter((t) => !t.completed)
         .map((t) => `${t.step}. ${t.text}`)
         .join("\n");
-      return {
-        message: {
-          customType: "modes-context",
-          content: `[EXECUTING PLAN — full tool access]\n\nRemaining steps:\n${remaining}\n\nExecute each step in order. After finishing a step, include a [DONE:n] tag in your reply.`,
-          display: false,
-        },
-      };
+      modeBlock = `[Plan/executing] Execute steps from plan.md. Remaining:\n${remaining}\nMark progress with [DONE:n] tags.`;
+      planPhase = "executing";
+      if (complianceBlock) modeBlock = `${modeBlock}\n${complianceBlock}`;
+    } else {
+      const planPath =
+        currentMode === "plan" ? shortenPath(ensurePlanFile(ctx.cwd)) : undefined;
+      modeBlock = resolveModePrompt({
+        mode: currentMode,
+        planPhase,
+        planFilePath: planPath,
+        needsAskReminder,
+        needsBypassSecurityReminder,
+        pendingComplianceInject,
+        complianceCategory,
+      });
     }
 
-    const result: {
-      message?: { customType: string; content: string; display: boolean }
-      systemPrompt?: string
-    } = {};
-
-    // Inject mode context
-    const content = MODE_CONTEXT[currentMode];
-    if (content) {
-      result.message = {
-        customType: "modes-context",
-        content,
-        display: false,
-      };
+    if (pendingComplianceInject) {
+      pendingComplianceInject = false;
+      complianceCategory = "";
     }
+    if (needsAskReminder) needsAskReminder = false;
+    if (needsBypassSecurityReminder) needsBypassSecurityReminder = false;
 
-    // Filter skills from the system prompt when a mode-specific filter is
-    // active. resolveSkillFilter returns ["*"] (allow all) when no filter is
-    // configured, in which case filterSkillsFromPrompt is a no-op.
     const skillFilter = resolveSkillFilter(modelProfileConfig, currentMode);
+    let workingPrompt = systemPromptBase;
     if (skillFilter.length !== 1 || skillFilter[0] !== "*") {
-      // We have a specific skill filter — modify the system prompt.
-      // event.systemPrompt is the rendered prompt; ctx.getSystemPrompt() returns
-      // the current system prompt (which may have been modified by an earlier
-      // extension). Prefer the event value for the first-pass read.
-      const systemPrompt =
-        event?.systemPrompt ?? ctx?.getSystemPrompt?.() ?? "";
-      if (systemPrompt) {
-        const filtered = filterSkillsFromPrompt(systemPrompt, skillFilter);
-        // Defensive guard (v1.1.5): if filtering was a no-op despite a
-        // non-empty, non-"*" allowlist (i.e. user explicitly named skills
-        // to keep), the regex probably drifted from pi's actual
-        // `formatSkillsForPrompt` schema. Surface this loudly so future
-        // regressions don't ship silently like v1.1.4 did.
-        //
-        // We only warn when skillFilter is non-empty: `[]` is the documented
-        // "allow all" sentinel and a legitimate no-op (see filterSkillsFromPrompt).
+      if (workingPrompt) {
+        const filtered = filterSkillsFromPrompt(workingPrompt, skillFilter);
         if (
           skillFilter.length > 0 &&
-          filtered === systemPrompt &&
-          systemPrompt.includes("<skill")
+          filtered === workingPrompt &&
+          workingPrompt.includes("<skill")
         ) {
           console.warn(
             `[permission-modes] Skill filter for mode "${currentMode}" was a no-op ` +
-              `(${skillFilter.length} skill(s) requested: ${skillFilter.join(", ")}). ` +
-              `The system prompt contains <skill> blocks but none matched the filter. ` +
-              `This usually means pi changed formatSkillsForPrompt() and our regex ` +
-              `needs updating.`,
+              `(${skillFilter.length} skill(s) requested: ${skillFilter.join(", ")}).`,
           );
         }
-        result.systemPrompt = filtered;
+        workingPrompt = filtered;
       }
     }
 
-    return Object.keys(result).length > 0 ? result : undefined;
+    const anchored = injectModePrompt(workingPrompt, modeBlock);
+    if (anchored !== workingPrompt || modeBlock) {
+      return { systemPrompt: anchored };
+    }
+    return undefined;
   });
 
   pi.on("context", async (event) => {
@@ -1017,7 +1129,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   );
   pi.on("message_update", async (_event, ctx) => refreshWorkingMessage(ctx));
 
-  // ---- turn_end: tps + plan-step tracking + auto follow-up ---------------
+  // ---- turn_end: tps + plan-step tracking --------------------------------
   pi.on("turn_end", async (event, ctx) => {
     try {
       gitBranch = (ctx.sessionManager as any).getGitBranch?.() ?? gitBranch;
@@ -1039,33 +1151,11 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       if (markCompletedSteps(text, planTodos) > 0) updatePlanWidget(ctx);
       persistState();
     }
-
-    if (currentMode === "auto" && !isStepping) {
-      if (autoFollowUpDepth > 0 && autoFollowUpCount >= autoFollowUpDepth)
-        return;
-      if (hasToolCalls(msg) && !isCompletionSignal(text)) {
-        isStepping = true;
-        autoFollowUpCount++;
-        try {
-          pi.sendUserMessage(
-            "Continue. Auto mode is active — proceed without asking.",
-            {
-              deliverAs: "followUp",
-            },
-          );
-        } catch (err) {
-          // followUp delivery not supported in this pi version — disable stepping
-          isStepping = false;
-          console.warn("[permission-modes] auto follow-up unavailable:", err);
-        }
-      }
-    }
   });
 
   // ---- agent_end: idle reset + plan complete + plan offer ----------------
   pi.on("agent_end", async (event, ctx) => {
-    isStepping = false;
-    if (ctx.hasUI) ctx.ui.setWorkingMessage(); // restore default loader when idle
+    if (ctx.hasUI) ctx.ui.setWorkingMessage();
 
     // Plan execution in progress: announce completion when all steps are done.
     if (planExecuting && planTodos.length) {
@@ -1088,14 +1178,47 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       return;
     }
 
-    // In plan mode (and interactive): extract the plan and offer next action.
-    if (currentMode !== "plan" || !ctx.hasUI) return;
+    // In plan mode: sync plan.md and offer next action (throttled).
+    if (currentMode !== "plan" || !ctx.hasUI || planExecuting) return;
+
+    const planContent = readPlanFile(ctx.cwd);
+    let extracted = filterSubstantivePlanItems(
+      planContent ? extractTodoItems(planContent) : [],
+    );
+
     const lastAssistant = [...(event.messages as any[])]
       .reverse()
       .find(isAssistant);
-    if (!lastAssistant) return;
-    const extracted = extractTodoItems(getText(lastAssistant));
+    const assistantText = lastAssistant ? getText(lastAssistant) : "";
+    const assistantPlan = assistantText
+      ? filterSubstantivePlanItems(extractTodoItems(assistantText))
+      : [];
+
+    if (!extracted.length && assistantPlan.length) {
+      if (shouldSyncAssistantPlanToFile(planContent)) {
+        const planSection = extractPlanSection(assistantText);
+        if (planSection) writePlanFile(ctx.cwd, planSection);
+        extracted = assistantPlan;
+      }
+    } else if (assistantPlan.length) {
+      if (shouldSyncAssistantPlanToFile(planContent)) {
+        const assistantSection = extractPlanSection(assistantText);
+        if (assistantSection) writePlanFile(ctx.cwd, assistantSection);
+        extracted = assistantPlan;
+      }
+    }
+
     if (!extracted.length) return;
+
+    const syncedContent = readPlanFile(ctx.cwd) ?? planContent ?? "";
+    const contentHash = hashPlan(
+      syncedContent || JSON.stringify(extracted),
+    );
+    const isFirst = !lastExtractedPlanHash;
+    const changed = contentHash !== lastExtractedPlanHash;
+    if (!isFirst && !changed) return;
+
+    lastExtractedPlanHash = contentHash;
     planTodos = extracted;
     persistState();
 
@@ -1107,10 +1230,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
     if (choice === "Execute the plan") {
       planExecuting = true;
+      planPhase = "executing";
       currentMode = "auto";
-      autoFollowUpCount = 0;
-      isStepping = false;
-      applyToolRestrictions(); // restores edit/write
+      applyToolRestrictions();
       updateStatus(ctx);
       updatePlanWidget(ctx);
       persistState();
@@ -1125,11 +1247,21 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         { triggerTurn: true, deliverAs: "followUp" },
       );
     } else if (choice === "Refine the plan") {
+      planPhase = "refining";
       const refinement = await ctx.ui.editor("Refine the plan:", "");
       if (refinement && refinement.trim()) {
         pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
       }
+    } else {
+      planPhase = "refining";
     }
+  });
+
+  pi.on("session_compact", async (_event, ctx) => {
+    if (currentMode === "bypass") {
+      needsBypassSecurityReminder = true;
+    }
+    persistState();
   });
 
   // ---- session start / resume -------------------------------------------
@@ -1141,6 +1273,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     // and writes a default file with the user's default model detected from
     // settings.json). Re-runs on /reload so a user-deleted file is recreated.
     modelProfileConfig = ensureModelProfilesConfig();
+    classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
 
     const flag = pi.getFlag("permission-mode");
     if (typeof flag === "string") {
@@ -1176,10 +1309,16 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         let m = last.data.currentMode;
         if (m === "normal") m = "default";      // legacy (v0.x)
         if (m === "default") m = "ask";          // v1.0.0 → v2.0.0 rename
-        if (m === "accept-edits") m = "ask";     // removed mode → fall back to ask
+        if (m === "accept-edits") m = "ask";
         if ((MODE_CYCLE as string[]).includes(m)) currentMode = m;
-        if (typeof last.data.autoFollowUpDepth === "number")
-          autoFollowUpDepth = last.data.autoFollowUpDepth;
+        if (typeof last.data.planPhase === "string")
+          planPhase = last.data.planPhase as PlanPhase;
+        if (typeof last.data.planExecuting === "boolean")
+          planExecuting = last.data.planExecuting;
+        if (Array.isArray(last.data.planTodos))
+          planTodos = last.data.planTodos as TodoItem[];
+        if (typeof last.data.lastExtractedPlanHash === "string")
+          lastExtractedPlanHash = last.data.lastExtractedPlanHash;
         if (typeof last.data.activeProfile === "string")
           activeProfile = last.data.activeProfile;
       }
@@ -1203,6 +1342,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     }
 
     applyToolRestrictions();
+    if (planExecuting && planTodos.length) updatePlanWidget(ctx);
+    if (currentMode === "ask") needsAskReminder = true;
     if (ctx.hasUI) {
       installFooter(ctx);
       updateStatus(ctx);

@@ -1,27 +1,40 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { readdirSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import {
+	checkAutoRisk,
 	commandTargetsOutsideCwd,
+	ensurePlanFile,
+	extractPlanSection,
 	extractTodoItems,
 	filterSkillsFromPrompt,
+	filterSubstantivePlanItems,
 	findProjectRoot,
 	formatCount,
+	getPlanFilePath,
 	getProjectId,
 	getProjectTmpDir,
 	hashPath,
+	hashPlan,
+	injectModePrompt,
 	isCompletionSignal,
 	isInsideProject,
 	isOutsideCwd,
+	isPlanFilePath,
+	isPlaceholderPlanItem,
 	isSafeCommand,
 	listTrackedOutsideWrites,
 	markCompletedSteps,
 	popTrackedOutsideWrite,
+	readPlanFile,
+	resolveModePrompt,
 	restoreOutsideWrite,
+	shouldSyncAssistantPlanToFile,
 	trackOutsideWrite,
+	writePlanFile,
 	type OutsideWriteSnapshot,
 	type TodoItem,
 } from "./utils.ts";
@@ -884,5 +897,106 @@ describe("filterSkillsFromPrompt", () => {
 		// Wrapper tags preserved (caller decides what to do with empty)
 		expect(result).toContain("<available_skills>")
 		expect(result).toContain("</available_skills>")
+	})
+})
+
+describe("injectModePrompt", () => {
+	it("injects anchor block and replaces previous block", () => {
+		const base = "Base prompt\n"
+		const first = injectModePrompt(base, "[Ask] reminder")
+		expect(first).toContain("<!-- permission-modes:context -->")
+		expect(first).toContain("[Ask] reminder")
+		const second = injectModePrompt(first, "[Plan] new")
+		expect(second.match(/<!-- permission-modes:context -->/g)?.length).toBe(1)
+		expect(second).toContain("[Plan] new")
+		expect(second).not.toContain("[Ask] reminder")
+	})
+
+	it("returns stripped prompt when mode block is empty", () => {
+		const withBlock = injectModePrompt("base", "[Ask] x")
+		expect(injectModePrompt(withBlock, "").trimEnd()).toBe("base")
+	})
+})
+
+describe("resolveModePrompt", () => {
+	it("returns ask reminder only when flagged", () => {
+		expect(resolveModePrompt({ mode: "ask" })).toBe("")
+		expect(
+			resolveModePrompt({ mode: "ask", needsAskReminder: true }),
+		).toContain("[Ask]")
+	})
+
+	it("returns plan path block", () => {
+		const block = resolveModePrompt({
+			mode: "plan",
+			planFilePath: "/tmp/plan.md",
+		})
+		expect(block).toContain("/tmp/plan.md")
+	})
+
+	it("auto has no routine injection", () => {
+		expect(resolveModePrompt({ mode: "auto" })).toBe("")
+	})
+})
+
+describe("plan helpers", () => {
+	it("filters placeholder plan items", () => {
+		expect(isPlaceholderPlanItem("(pending)")).toBe(true)
+		expect(filterSubstantivePlanItems([
+			{ step: 1, text: "(pending)", completed: false },
+			{ step: 2, text: "Implement feature", completed: false },
+		])).toHaveLength(1)
+	})
+
+	it("extractPlanSection returns only plan block", () => {
+		const section = extractPlanSection("Intro\n\nPlan:\n1. Do thing\n\nDone.")
+		expect(section).toContain("Plan:")
+		expect(section).not.toContain("Intro")
+	})
+
+	it("isPlanFilePath uses cwd", () => {
+		const cwd = "/proj"
+		const planPath = getPlanFilePath(cwd)
+		expect(isPlanFilePath(planPath, cwd)).toBe(true)
+		expect(isPlanFilePath("plan.md", cwd)).toBe(false)
+	})
+
+	it("isPlanFilePath expands tilde paths", () => {
+		const home = homedir()
+		const cwd = join(home, "proj")
+		const planPath = getPlanFilePath(cwd)
+		const tildePath = `~${planPath.slice(home.length)}`
+		expect(isPlanFilePath(tildePath, cwd)).toBe(true)
+	})
+	it("shouldSyncAssistantPlanToFile guards hand-edited content", () => {
+		expect(shouldSyncAssistantPlanToFile(null)).toBe(true)
+		expect(shouldSyncAssistantPlanToFile("# My custom notes\nno plan header")).toBe(
+			false,
+		)
+		expect(
+			shouldSyncAssistantPlanToFile(
+				"<!-- permission-modes:plan -->\nPlan:\n1. (pending)",
+			),
+		).toBe(true)
+	})
+})
+
+describe("isOutsideCwd with tilde", () => {
+	it("treats ~/outside as outside project cwd", () => {
+		const cwd = join(homedir(), "project")
+		expect(isOutsideCwd("~/secrets.txt", cwd)).toBe(true)
+	})
+})
+
+describe("checkAutoRisk", () => {
+	const cwd = "/home/user/project"
+
+	it("flags risky bash and outside writes", () => {
+		expect(checkAutoRisk({ tool: "bash", command: "rm -rf /" }, cwd).match).toBe(
+			true,
+		)
+		expect(
+			checkAutoRisk({ tool: "write", path: "/etc/hosts" }, cwd).match,
+		).toBe(true)
 	})
 })

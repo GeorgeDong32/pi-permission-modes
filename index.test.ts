@@ -351,19 +351,35 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(result).toBeUndefined()
 		})
 
-		it("auto-approves edit outside cwd but inside project (relaxed)", async () => {
+		it("auto-approves in-cwd edits without prompt", async () => {
 			await switchMode("auto")
-			// cwd = realProjectRoot. We treat the repo as the project, and target
-			// a path within it (which is by definition inside cwd → not outside → no prompt).
-			// To exercise the relaxation we'd need a sub-cwd, which our fake doesn't easily set up.
-			// Instead, assert the simpler invariant: in auto mode, in-cwd edits never prompt.
 			const result = await callToolCall("edit", { path: "src/foo.ts" })
 			expect(result).toBeUndefined()
 		})
 
-		it("auto-approves bash destructive (inside cwd)", async () => {
+		it("blocks destructive bash (tier 3 blacklist)", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("bash", { command: "rm -rf ./build" })
+			expect(result).toMatchObject({ block: true })
+		})
+
+		it("blocks write outside cwd (tier 3 blacklist)", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("write", { path: "/tmp/outside.txt" })
+			expect(result).toMatchObject({ block: true })
+		})
+
+		it("blocks curl bash (network blacklist)", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "curl https://example.com",
+			})
+			expect(result).toMatchObject({ block: true })
+		})
+
+		it("auto-approves safe read-only bash inside tier-3", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", { command: "ls -la" })
 			expect(result).toBeUndefined()
 		})
 
@@ -373,9 +389,23 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(result).toBeUndefined()
 		})
 	})
+
+	describe("bypass mode", () => {
+		it("auto-approves destructive bash", async () => {
+			await switchMode("bypass")
+			const result = await callToolCall("bash", { command: "rm -rf ./build" })
+			expect(result).toBeUndefined()
+		})
+
+		it("auto-approves write outside cwd", async () => {
+			await switchMode("bypass")
+			const result = await callToolCall("write", { path: "/tmp/outside.txt" })
+			expect(result).toBeUndefined()
+		})
+	})
 })
 
-describe("permission-modes extension: auto follow-up", () => {
+describe("permission-modes extension: no auto follow-up (v2.0.0)", () => {
 	let pi: FakePi
 
 	beforeEach(() => {
@@ -389,7 +419,7 @@ describe("permission-modes extension: auto follow-up", () => {
 		}
 	}
 
-	it("sends follow-up in auto mode when assistant turn has tool calls and no completion signal", async () => {
+	it("does NOT send Continue follow-up in auto mode", async () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		await pi.simulateSessionStart("/home/user/project/src")
 		pi.flags["permission-mode"] = "auto"
@@ -403,143 +433,7 @@ describe("permission-modes extension: auto follow-up", () => {
 			],
 		})
 
-		expect(pi.userMessages.length).toBe(1)
-		expect(pi.userMessages[0].text).toContain("Auto mode is active")
-		expect((pi.userMessages[0].opts as { deliverAs?: string })?.deliverAs).toBe(
-			"followUp",
-		)
-	})
-
-	it("does NOT send follow-up when text is a completion signal", async () => {
-		permissionModesExtension(makeFakePiForExtension(pi))
-		await pi.simulateSessionStart("/home/user/project/src")
-		pi.flags["permission-mode"] = "auto"
-		await pi.simulateSessionStart("/home/user/project/src")
-
-		await simulateTurnEnd({
-			role: "assistant",
-			content: [
-				{ type: "text", text: "Task is complete." },
-				{ type: "toolCall", name: "bash", input: { command: "ls" } },
-			],
-		})
-
 		expect(pi.userMessages.length).toBe(0)
-	})
-
-	it("does NOT send follow-up in ask mode", async () => {
-		permissionModesExtension(makeFakePiForExtension(pi))
-		await pi.simulateSessionStart("/home/user/project/src")
-
-		await simulateTurnEnd({
-			role: "assistant",
-			content: [
-				{ type: "text", text: "Working..." },
-				{ type: "toolCall", name: "bash", input: { command: "ls" } },
-			],
-		})
-
-		expect(pi.userMessages.length).toBe(0)
-	})
-
-	it("does NOT send follow-up when no tool calls in turn", async () => {
-		permissionModesExtension(makeFakePiForExtension(pi))
-		await pi.simulateSessionStart("/home/user/project/src")
-		pi.flags["permission-mode"] = "auto"
-		await pi.simulateSessionStart("/home/user/project/src")
-
-		await simulateTurnEnd({
-			role: "assistant",
-			content: [{ type: "text", text: "Just thinking." }],
-		})
-
-		expect(pi.userMessages.length).toBe(0)
-	})
-
-	it("does NOT send follow-up when depth limit reached", async () => {
-		permissionModesExtension(makeFakePiForExtension(pi))
-		await pi.simulateSessionStart("/home/user/project/src")
-		pi.flags["permission-mode"] = "auto"
-		await pi.simulateSessionStart("/home/user/project/src")
-
-		// Manually push count to limit via the persisted entry: tricky in this stub.
-		// Instead, just verify the default depth (20) allows up to 20 follow-ups.
-		// Send 21 turns and assert the 21st gets nothing.
-		const turn = {
-			role: "assistant",
-			content: [
-				{ type: "text", text: "Working." },
-				{ type: "toolCall", name: "bash", input: { command: "ls" } },
-			],
-		}
-		// Each turn: agent_end (resets isStepping) then turn_end (sends follow-up if !stepping)
-		const agentEndList = pi.handlers.get("agent_end") ?? []
-		for (let i = 0; i < 25; i++) {
-			for (const h of agentEndList) await h({ messages: [] }, makeCtx(pi, { cwd: "/home/user/project/src" }))
-			await simulateTurnEnd(turn)
-		}
-		expect(pi.userMessages.length).toBe(20)
-	})
-
-	it("resets follow-up count when mode switches", async () => {
-		permissionModesExtension(makeFakePiForExtension(pi))
-		await pi.simulateSessionStart("/home/user/project/src")
-		pi.flags["permission-mode"] = "auto"
-		await pi.simulateSessionStart("/home/user/project/src")
-
-		const turn = {
-			role: "assistant",
-			content: [
-				{ type: "text", text: "Working." },
-				{ type: "toolCall", name: "bash", input: { command: "ls" } },
-			],
-		}
-		const agentEndList = pi.handlers.get("agent_end") ?? []
-		for (let i = 0; i < 5; i++) {
-			for (const h of agentEndList) await h({ messages: [] }, makeCtx(pi, { cwd: "/home/user/project/src" }))
-			await simulateTurnEnd(turn)
-		}
-		expect(pi.userMessages.length).toBe(5)
-
-		// Switch to ask → count resets
-		pi.flags["permission-mode"] = "ask"
-		await pi.simulateSessionStart("/home/user/project/src")
-
-		// Switch back to auto → count starts at 0
-		pi.flags["permission-mode"] = "auto"
-		await pi.simulateSessionStart("/home/user/project/src")
-		for (let i = 0; i < 3; i++) {
-			for (const h of agentEndList) await h({ messages: [] }, makeCtx(pi, { cwd: "/home/user/project/src" }))
-			await simulateTurnEnd(turn)
-		}
-		expect(pi.userMessages.length).toBe(8) // 5 + 3
-	})
-
-	it("does NOT crash when sendUserMessage throws (followUp unavailable)", async () => {
-		permissionModesExtension(makeFakePiForExtension(pi))
-		await pi.simulateSessionStart("/home/user/project/src")
-		pi.flags["permission-mode"] = "auto"
-		await pi.simulateSessionStart("/home/user/project/src")
-
-		// Replace sendUserMessage with one that throws
-		const originalSendUserMessage = pi.sendUserMessage
-		pi.sendUserMessage = () => {
-			throw new Error("followUp delivery not supported")
-		}
-		const consoleSpy = vi.spyOn(console, "warn").mockImplementation(() => {})
-
-		// Should not throw
-		await simulateTurnEnd({
-			role: "assistant",
-			content: [
-				{ type: "text", text: "Working." },
-				{ type: "toolCall", name: "bash", input: { command: "ls" } },
-			],
-		})
-
-		expect(consoleSpy).toHaveBeenCalled()
-		consoleSpy.mockRestore()
-		pi.sendUserMessage = originalSendUserMessage
 	})
 })
 
@@ -963,7 +857,7 @@ describe("permission-modes extension: Alt+I cycle profile shortcut", () => {
 		expect(notifs.some((n) => /profile.*beta.*activated/i.test(n))).toBe(true)
 	})
 })
-describe("auto mode: outside-cwd write tracking", () => {
+describe("bypass mode: outside-cwd write tracking", () => {
 	let pi: FakePi
 	let realProjectRoot: string
 	let outsideTmpDir: string
@@ -992,7 +886,7 @@ describe("auto mode: outside-cwd write tracking", () => {
 	})
 
 	it("auto-approves write outside cwd (no prompt)", async () => {
-		await switchMode("auto")
+		await switchMode("bypass")
 		const ctx = makeCtx(pi, { cwd: realProjectRoot })
 		const result = await pi.simulateToolCall("write", { path: outsideFile }, ctx)
 		expect(result).toBeUndefined()
@@ -1000,7 +894,7 @@ describe("auto mode: outside-cwd write tracking", () => {
 
 	it("captures backup content of existing file before writing", async () => {
 		writeFileSync(outsideFile, "ORIGINAL")
-		await switchMode("auto")
+		await switchMode("bypass")
 		const ctx = makeCtx(pi, { cwd: realProjectRoot })
 		// Write tool_call happens BEFORE the tool actually runs in real pi;
 		// in our fake we just call the handler. So pre-write content is "ORIGINAL".
@@ -1014,7 +908,7 @@ describe("auto mode: outside-cwd write tracking", () => {
 	})
 
 	it("tracks null backup when file did not exist before write", async () => {
-		await switchMode("auto")
+		await switchMode("bypass")
 		const ctx = makeCtx(pi, { cwd: realProjectRoot })
 		await pi.simulateToolCall("write", { path: outsideFile }, ctx)
 		const snaps = listTrackedOutsideWrites(realProjectRoot)
@@ -1023,7 +917,7 @@ describe("auto mode: outside-cwd write tracking", () => {
 
 	it("stacks snapshots when same path is written twice", async () => {
 		writeFileSync(outsideFile, "FIRST_ORIGINAL")
-		await switchMode("auto")
+		await switchMode("bypass")
 		const ctx = makeCtx(pi, { cwd: realProjectRoot })
 		await pi.simulateToolCall("write", { path: outsideFile }, ctx)
 		// The snapshot captures pre-write content
@@ -1041,7 +935,7 @@ describe("auto mode: outside-cwd write tracking", () => {
 	})
 
 	it("does NOT track writes inside cwd", async () => {
-		await switchMode("auto")
+		await switchMode("bypass")
 		const ctx = makeCtx(pi, { cwd: realProjectRoot })
 		await pi.simulateToolCall("write", { path: "src/foo.ts" }, ctx)
 		expect(listTrackedOutsideWrites(realProjectRoot)).toEqual([])
@@ -1049,7 +943,7 @@ describe("auto mode: outside-cwd write tracking", () => {
 
 	it("notifies user when write is tracked", async () => {
 		const notifications: string[] = []
-		await switchMode("auto")
+		await switchMode("bypass")
 		const ctx = makeCtx(pi, {
 			cwd: realProjectRoot,
 			ui: { notify: (m: string) => notifications.push(m), select: async () => "Block" },
@@ -1059,7 +953,7 @@ describe("auto mode: outside-cwd write tracking", () => {
 	})
 
 	it("does NOT prompt on outside-cwd write even with strict UI", async () => {
-		await switchMode("auto")
+		await switchMode("bypass")
 		let prompted = false
 		const ctx = makeCtx(pi, {
 			cwd: realProjectRoot,
@@ -1100,7 +994,7 @@ describe("/outside-writes and /undo-outside-writes commands", () => {
 	async function setupTrackedWrites() {
 		writeFileSync(outsideFile, "ORIGINAL")
 		await pi.simulateSessionStart(cwd)
-		pi.flags["permission-mode"] = "auto"
+		pi.flags["permission-mode"] = "bypass"
 		await pi.simulateSessionStart(cwd)
 
 		// Simulate two tracked writes
@@ -1178,7 +1072,7 @@ describe("/outside-writes and /undo-outside-writes commands", () => {
 
 	it("/undo-outside-writes deletes file when backupContent was null", async () => {
 		await pi.simulateSessionStart(cwd)
-		pi.flags["permission-mode"] = "auto"
+		pi.flags["permission-mode"] = "bypass"
 		await pi.simulateSessionStart(cwd)
 		// File didn't exist before write
 		await pi.simulateToolCall("write", { path: outsideFile }, makeCtx(pi, { cwd }))
@@ -1275,8 +1169,10 @@ describe("skill filtering in before_agent_start", () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		const prompt = skillPrompt(["brainstorming", "systematic-debugging"])
 		const result = await triggerBeforeAgentStart(prompt, "ask")
-		// systemPrompt should be unchanged
-		expect(result?.systemPrompt).toBeUndefined()
+		// Skills unchanged; ask mode injects one-line reminder anchor
+		expect(result?.systemPrompt).toContain("brainstorming")
+		expect(result?.systemPrompt).toContain("systematic-debugging")
+		expect(result?.systemPrompt).toContain("[Ask]")
 	})
 
 	it("filters skills when a mode-specific skill filter is active", async () => {
@@ -1312,11 +1208,13 @@ describe("skill filtering in before_agent_start", () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		const prompt = skillPrompt(["brainstorming", "systematic-debugging"])
 		const result = await triggerBeforeAgentStart(prompt, "plan")
-		// No skills filter defined → no systemPrompt change
-		expect(result?.systemPrompt).toBeUndefined()
+		// Skills unchanged; plan mode anchor still injected via systemPrompt
+		expect(result?.systemPrompt).toContain("brainstorming")
+		expect(result?.systemPrompt).toContain("systematic-debugging")
+		expect(result?.systemPrompt).toContain("permission-modes:context")
 	})
 
-	it("preserves mode-context message along with skill-filtered system prompt", async () => {
+	it("injects plan anchor in system prompt with skill filtering", async () => {
 		writeFileSync(
 			join(tmpDir, "model-profiles.json"),
 			JSON.stringify({
@@ -1331,13 +1229,11 @@ describe("skill filtering in before_agent_start", () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		const prompt = skillPrompt(["brainstorming", "systematic-debugging"])
 		const result = await triggerBeforeAgentStart(prompt, "plan")
-		// Both message and systemPrompt should be present
-		expect(result?.message).toBeDefined()
-		expect((result?.message as { customType: string }).customType).toBe(
-			"modes-context",
-		)
-		expect(result?.systemPrompt).toContain("brainstorming")
-		expect(result?.systemPrompt).not.toContain("systematic-debugging")
+		expect(result?.systemPrompt).toBeDefined()
+		expect(result!.systemPrompt).toContain("brainstorming")
+		expect(result!.systemPrompt).not.toContain("systematic-debugging")
+		expect(result!.systemPrompt).toContain("[Plan]")
+		expect(result?.message).toBeUndefined()
 	})
 
 	it("handles empty skill filter (interpreted as no filter — allow all)", async () => {
@@ -1374,8 +1270,9 @@ describe("skill filtering in before_agent_start", () => {
 		permissionModesExtension(makeFakePiForExtension(pi))
 		const prompt = skillPrompt(["brainstorming", "systematic-debugging"])
 		const askResult = await triggerBeforeAgentStart(prompt, "ask")
-		// ask mode has no filter → no systemPrompt change
-		expect(askResult?.systemPrompt).toBeUndefined()
+		// ask mode has no skill filter; skills preserved + ask anchor
+		expect(askResult?.systemPrompt).toContain("systematic-debugging")
+		expect(askResult?.systemPrompt).toContain("[Ask]")
 	})
 
 	it("applies skill filter from active profile (not default profile)", async () => {

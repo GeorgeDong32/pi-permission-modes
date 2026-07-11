@@ -36,6 +36,7 @@ export interface ModelProfile {
 	ask?: string | ModeConfig
 	plan?: string | ModeConfig
 	auto?: string | ModeConfig
+	bypass?: string | ModeConfig
 }
 
 /** Full config file shape: an `active` pointer plus any number of named profiles. */
@@ -174,7 +175,7 @@ export function ensureModelProfilesConfig(): ModelProfilesConfig {
  */
 export function resolveModelForMode(
 	config: ModelProfilesConfig,
-	mode: "ask" | "plan" | "auto",
+	mode: "ask" | "plan" | "auto" | "bypass",
 ): string | undefined {
 	const profileName = config.active || "default"
 	const profile = config[profileName] as ModelProfile | undefined
@@ -230,7 +231,7 @@ function normalizeModeEntry(
  */
 export function resolveModeConfig(
 	config: ModelProfilesConfig,
-	mode: "ask" | "plan" | "auto",
+	mode: "ask" | "plan" | "auto" | "bypass",
 ): ModeConfig {
 	const profileName = config.active || "default"
 
@@ -260,7 +261,7 @@ export function resolveModeConfig(
  */
 export function resolveSkillFilter(
 	config: ModelProfilesConfig,
-	mode: "ask" | "plan" | "auto",
+	mode: "ask" | "plan" | "auto" | "bypass",
 ): string[] {
 	return resolveModeConfig(config, mode).skills ?? ["*"]
 }

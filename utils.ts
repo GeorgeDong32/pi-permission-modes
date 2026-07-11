@@ -12,6 +12,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs"
 import { createHash } from "node:crypto"
+import { homedir } from "node:os"
 import path from "node:path"
 
 const MAX_TRACKED_WRITES = 100
@@ -204,6 +205,14 @@ export function formatCount(n: number): string {
 	return `${k >= 10 ? Math.round(k) : k.toFixed(1)}k`;
 }
 
+/** Expand leading `~` for path comparisons (does not resolve symlinks). */
+function expandUserPath(p: string): string {
+	const home = homedir()
+	if (p === "~") return home
+	if (p.startsWith("~/")) return path.join(home, p.slice(2))
+	return p
+}
+
 /**
  * Returns true iff `targetPath` resolves to a location outside `cwd`.
  *
@@ -213,9 +222,10 @@ export function formatCount(n: number): string {
  */
 export function isOutsideCwd(targetPath: string, cwd: string): boolean {
 	if (!targetPath) return false;
-	const resolved = path.isAbsolute(targetPath)
-		? path.resolve(targetPath)
-		: path.resolve(cwd, targetPath);
+	const p = expandUserPath(targetPath);
+	const resolved = path.isAbsolute(p)
+		? path.resolve(p)
+		: path.resolve(cwd, p);
 	const cwdAbs = path.resolve(cwd);
 	// Same dir or strictly inside cwd → not outside
 	if (resolved === cwdAbs) return false;
@@ -518,6 +528,241 @@ export function popTrackedOutsideWrite(
  * @param allowedSkills  Array of skill names to keep, or ["*"] for all
  * @returns Modified prompt with disallowed skill blocks removed
  */
+// ---- Mode prompt anchor injection (v2.0.0) ------------------------------
+
+export const MODE_PROMPT_BEGIN = "<!-- permission-modes:context -->"
+export const MODE_PROMPT_END = "<!-- /permission-modes:context -->"
+
+const MODE_PROMPT_BLOCK_RE =
+	/<!-- permission-modes:context -->[\s\S]*?<!-- \/permission-modes:context -->\n?/
+
+export type PermissionMode = "ask" | "plan" | "auto" | "bypass"
+export type PlanPhase = "exploring" | "refining" | "executing"
+
+export function injectModePrompt(
+	systemPrompt: string,
+	modeBlock: string,
+): string {
+	const stripped = systemPrompt.replace(MODE_PROMPT_BLOCK_RE, "")
+	if (!modeBlock.trim()) return stripped
+	return `${stripped}\n${MODE_PROMPT_BEGIN}\n${modeBlock.trim()}\n${MODE_PROMPT_END}`
+}
+
+export interface ResolveModePromptOpts {
+	mode: PermissionMode
+	planPhase?: PlanPhase
+	planFilePath?: string
+	needsAskReminder?: boolean
+	needsBypassSecurityReminder?: boolean
+	pendingComplianceInject?: boolean
+	complianceCategory?: string
+}
+
+export function resolveModePrompt(opts: ResolveModePromptOpts): string {
+	const {
+		mode,
+		planPhase = "exploring",
+		planFilePath,
+		needsAskReminder,
+		needsBypassSecurityReminder,
+		pendingComplianceInject,
+		complianceCategory,
+	} = opts
+
+	if (pendingComplianceInject) {
+		const cat = complianceCategory ? ` (${complianceCategory})` : ""
+		return `[Auto] Your last tool call was blocked${cat}. Confirm the action aligns with the user's request and is the safest approach. Retry with a safer alternative if unsure.`
+	}
+
+	if (mode === "ask" && needsAskReminder) {
+		return "[Ask] Edits, outside-cwd access, and mutating commands need approval. Inside-cwd reads are automatic."
+	}
+
+	if (mode === "plan" && planFilePath) {
+		let block = `[Plan] Read-only mode. Maintain the numbered plan in:\n  ${planFilePath}\nUse \`read\` to review and \`edit\` to update the plan file. Do not change other files.`
+		if (planPhase === "executing") {
+			block +=
+				"\n[Plan/executing] Execute steps from plan.md. Mark progress with [DONE:n] tags."
+		}
+		return block
+	}
+
+	if (mode === "bypass" && needsBypassSecurityReminder) {
+		return "[Bypass] All tool calls are auto-approved with no permission checks. You are responsible for security: avoid exfiltrating secrets, running untrusted downloads, or destructive commands outside the user's intent. Prefer isolated environments."
+	}
+
+	// auto and default: zero routine injection
+	return ""
+}
+
+/** Stable hash of plan content for popup throttling. */
+export function hashPlan(content: string): string {
+	return createHash("sha256").update(content).digest("hex").slice(0, 16)
+}
+
+// ---- Plan file helpers (v2.0.0) -----------------------------------------
+
+const PLAN_FILE_TEMPLATE = `# Plan
+
+<!-- permission-modes:plan -->
+Plan:
+1. (pending)
+<!-- /permission-modes:plan -->
+`
+
+export function getPlanFilePath(cwd: string): string {
+	const id = getProjectId(cwd)
+	return path.join(cwd, ".pi", "projects", id, "plan.md")
+}
+
+export function readPlanFile(cwd: string): string | null {
+	try {
+		const filePath = getPlanFilePath(cwd)
+		if (!existsSync(filePath)) return null
+		return readFileSync(filePath, "utf-8")
+	} catch {
+		return null
+	}
+}
+
+export function writePlanFile(cwd: string, content: string): void {
+	const filePath = getPlanFilePath(cwd)
+	mkdirSync(path.dirname(filePath), { recursive: true })
+	writeFileSync(filePath, content, { mode: 0o644 })
+}
+
+export function ensurePlanFile(cwd: string): string {
+	const filePath = getPlanFilePath(cwd)
+	try {
+		if (!existsSync(filePath)) {
+			mkdirSync(path.dirname(filePath), { recursive: true })
+			writeFileSync(filePath, PLAN_FILE_TEMPLATE, { mode: 0o644 })
+		}
+	} catch (err) {
+		console.warn("[permission-modes] Failed to ensure plan file:", err)
+	}
+	return filePath
+}
+
+export function resolveWorkspacePath(targetPath: string, cwd: string): string {
+	if (!targetPath) return path.resolve(cwd)
+	const p = expandUserPath(targetPath)
+	return path.isAbsolute(p) ? path.resolve(p) : path.resolve(cwd, p)
+}
+
+export function isPlanFilePath(targetPath: string, cwd: string): boolean {
+	if (!targetPath) return false
+	return (
+		resolveWorkspacePath(targetPath, cwd) ===
+		path.resolve(getPlanFilePath(cwd))
+	)
+}
+
+export function isPlaceholderPlanItem(text: string): boolean {
+	const t = text.trim().toLowerCase()
+	return t === "(pending)" || t === "pending" || t.length <= 3
+}
+
+export function filterSubstantivePlanItems(items: TodoItem[]): TodoItem[] {
+	return items.filter((item) => !isPlaceholderPlanItem(item.text))
+}
+
+/** Extract the `Plan:` section from an assistant message for plan.md sync. */
+export function extractPlanSection(message: string): string | null {
+	const headerMatch = message.match(/\*{0,2}Plan:\*{0,2}\s*\n/i)
+	if (!headerMatch) return null
+	const start = message.indexOf(headerMatch[0])
+	const section = message.slice(start).trim()
+	return section.length > 0 ? section : null
+}
+
+/** True when plan.md is missing, empty, or still the default placeholder template. */
+export function shouldSyncAssistantPlanToFile(planContent: string | null): boolean {
+	if (!planContent?.trim()) return true
+	if (!planContent.includes("<!-- permission-modes:plan -->")) return false
+	return filterSubstantivePlanItems(extractTodoItems(planContent)).length === 0
+}
+
+// ---- Auto risk patterns (v2.0.0) ----------------------------------------
+
+const AUTO_RISK_PATTERNS: Array<{ category: string; pattern: RegExp }> = [
+	{ category: "delete", pattern: /\brm\b/i },
+	{ category: "delete", pattern: /\brmdir\b/i },
+	{ category: "delete", pattern: /\bshred\b/i },
+	{ category: "delete", pattern: /\bdd\b/i },
+	{ category: "destructive", pattern: /\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone)/i },
+	{ category: "destructive", pattern: /\bmv\b/i },
+	{ category: "destructive", pattern: /\bcp\b/i },
+	{ category: "destructive", pattern: /\bmkdir\b/i },
+	{ category: "destructive", pattern: /\btouch\b/i },
+	{ category: "destructive", pattern: /(^|[^<])>(?!>)/ },
+	{ category: "destructive", pattern: />>/ },
+	{ category: "package-install", pattern: /\bnpm\s+(install|uninstall|update|ci|link|publish)/i },
+	{ category: "package-install", pattern: /\byarn\s+(add|remove|install|publish)/i },
+	{ category: "package-install", pattern: /\bpnpm\s+(add|remove|install|publish)/i },
+	{ category: "package-install", pattern: /\bpip\s+(install|uninstall)/i },
+	{ category: "package-install", pattern: /\bapt(-get)?\s+(install|remove|purge|upgrade)/i },
+	{ category: "package-install", pattern: /\bbrew\s+(install|uninstall|upgrade)/i },
+	{ category: "network", pattern: /\bcurl\b/i },
+	{ category: "network", pattern: /\bwget\b/i },
+	{ category: "network", pattern: /https?:\/\//i },
+	{ category: "privilege", pattern: /\bsudo\b/i },
+	{ category: "privilege", pattern: /\bchmod\b/i },
+	{ category: "privilege", pattern: /\bchown\b/i },
+	{ category: "process", pattern: /\bkill\b/i },
+	{ category: "process", pattern: /\bpkill\b/i },
+	{ category: "process", pattern: /\bkillall\b/i },
+	{ category: "system", pattern: /\breboot\b/i },
+	{ category: "system", pattern: /\bshutdown\b/i },
+	{ category: "system", pattern: /\bsystemctl\s+(start|stop|restart|enable|disable)/i },
+]
+
+export interface AutoRiskCheckInput {
+	tool: string
+	command?: string
+	path?: string
+}
+
+export interface AutoRiskResult {
+	match: boolean
+	category: string
+	reason: string
+}
+
+export function checkAutoRisk(
+	input: AutoRiskCheckInput,
+	cwd: string,
+): AutoRiskResult {
+	const noMatch: AutoRiskResult = { match: false, category: "", reason: "" }
+
+	if (input.tool === "bash") {
+		const cmd = input.command ?? ""
+		for (const { category, pattern } of AUTO_RISK_PATTERNS) {
+			if (pattern.test(cmd)) {
+				return {
+					match: true,
+					category,
+					reason: `Risky bash command blocked (${category}): ${cmd}`,
+				}
+			}
+		}
+		return noMatch
+	}
+
+	if (input.tool === "edit" || input.tool === "write") {
+		const pathStr = input.path ?? ""
+		if (pathStr && isOutsideCwd(pathStr, cwd)) {
+			return {
+				match: true,
+				category: "outside-cwd-write",
+				reason: `Write outside cwd blocked: ${pathStr}`,
+			}
+		}
+	}
+
+	return noMatch
+}
+
 export function filterSkillsFromPrompt(
 	prompt: string,
 	allowedSkills: string[],
