@@ -2,7 +2,7 @@
 
 ### Added
 - **Fourth mode: `bypass`** — full auto-approve (v1.1.6 auto semantics). Cycle is now `ask → plan → auto → bypass → ask` (Shift+Tab). Sparse security reminder on mode switch and after `session_compact`.
-- **Built-in auto classifier** (`classifier-client.ts` + `classifier-providers/`): optional LLM review for tier-3 tool calls. Uses `ctx.modelRegistry.getApiKeyAndHeaders()` only — **does not import `@earendil-works/pi-ai`**. Supports `anthropic-messages`, `openai-responses`, and `openai-completions`. Config: `~/.pi/agent/permission-modes.json` (`classifier.enabled` defaults to `false`).
+- **Built-in auto classifier** (`classifier-client.ts`): optional LLM review for tier-3 tool calls via `completeSimple` from `@earendil-works/pi-ai/compat` with auth from `ctx.modelRegistry.getApiKeyAndHeaders()`. Config: `~/.pi/agent/permission-modes.json` (`classifier.enabled` defaults to `false`).
 - **Plan file driver**: plan content lives at `<cwd>/.pi/projects/<projectId>/plan.md`; injection is path-only. Plan mode allows `edit`/`write` on that file only.
 - **System prompt anchor injection** (`<!-- permission-modes:context -->`) replaces per-turn `modes-context` messages.
 - **`AUTO_RISK_PATTERNS` blacklist** as permanent auto-mode fallback when classifier is off or fails.

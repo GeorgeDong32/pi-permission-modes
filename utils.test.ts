@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 import { readdirSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import {
@@ -20,6 +20,7 @@ import {
 	hashPath,
 	hashPlan,
 	injectModePrompt,
+	isAutoFallbackBash,
 	isCompletionSignal,
 	isInsideProject,
 	isOutsideCwd,
@@ -60,9 +61,12 @@ describe("isSafeCommand", () => {
 
 	it("rejects safe-prefixed commands that contain destructive content", () => {
 		// safe pattern + destructive = not safe
-		expect(isSafeCommand("ls && rm -rf /")).toBe(false);
-		expect(isSafeCommand("echo hi > out.txt")).toBe(false); // redirect
-	});
+		expect(isSafeCommand("ls && rm -rf /")).toBe(false)
+		expect(isSafeCommand("ls; python -c \"open('/tmp/x','w').write('x')\"")).toBe(
+			false,
+		)
+		expect(isSafeCommand("echo hi > out.txt")).toBe(false) // redirect
+	})
 
 	it("rejects empty / whitespace-only strings", () => {
 		expect(isSafeCommand("")).toBe(false);
@@ -73,6 +77,112 @@ describe("isSafeCommand", () => {
 	it("rejects unknown commands", () => {
 		expect(isSafeCommand("someweirdcommand foo bar")).toBe(false);
 	});
+
+	it("rejects safe-prefixed find with destructive flags", () => {
+		expect(isSafeCommand("find . -delete")).toBe(false);
+		expect(isSafeCommand("find . -exec rm {} \\;")).toBe(false);
+	});
+
+	it("allows literal nested markers inside single quotes", () => {
+		expect(isSafeCommand("rg -F '$(' src")).toBe(true)
+		expect(isSafeCommand("echo 'literal ` text'")).toBe(true)
+	});
+
+	it("still rejects nested execution outside single quotes", () => {
+		expect(isSafeCommand('echo "$(rm -rf /)"')).toBe(false)
+	});
+
+	it("treats escaped semicolons as part of one command", () => {
+		expect(isSafeCommand("printf foo\\;bar")).toBe(true)
+	});
+});
+
+describe("isAutoFallbackBash", () => {
+	it("allows routine build and test commands", () => {
+		expect(isAutoFallbackBash("npm test")).toBe(true)
+		expect(isAutoFallbackBash("npm run build")).toBe(true)
+		expect(isAutoFallbackBash("go test ./...")).toBe(true)
+		expect(isAutoFallbackBash("cargo test")).toBe(true)
+	})
+
+	it("rejects arbitrary package scripts", () => {
+		expect(isAutoFallbackBash("npm run deploy")).toBe(false)
+		expect(isAutoFallbackBash("pnpm run destroy-production")).toBe(false)
+		expect(isAutoFallbackBash("npm run build-and-deploy")).toBe(false)
+		expect(isAutoFallbackBash("pnpm run test:reset-db")).toBe(false)
+	})
+
+	it("rejects background compound commands", () => {
+		expect(
+			isAutoFallbackBash("npm test & python -c \"import os; os.system('id')\""),
+		).toBe(false)
+	})
+
+	it("rejects quoted compound commands with escaped closing quotes", () => {
+		expect(isAutoFallbackBash('npm test "\\\\"; npm run deploy')).toBe(false)
+		expect(isAutoFallbackBash("npm test 'foo\\'; npm run deploy")).toBe(false)
+		expect(isAutoFallbackBash('npm test \\"x; npm run deploy')).toBe(false)
+	})
+
+	it("rejects process substitution", () => {
+		expect(isAutoFallbackBash("npm test <(npm run deploy)")).toBe(false)
+	})
+
+	it("allows stderr redirection on fallback commands", () => {
+		expect(isAutoFallbackBash("npm test 2>&1")).toBe(true)
+	})
+
+	it("rejects executable and config injection flags on fallback commands", () => {
+		expect(isAutoFallbackBash("go test -exec /tmp/payload ./...")).toBe(false)
+		expect(isAutoFallbackBash("vitest --config /tmp/evil.config.ts")).toBe(false)
+		expect(isAutoFallbackBash("jest --config=evil.config.js")).toBe(false)
+		expect(isAutoFallbackBash("npm test -- node /tmp/exploit.js")).toBe(false)
+		expect(isAutoFallbackBash("cmake --build /tmp/out")).toBe(false)
+		expect(isAutoFallbackBash("go test -toolexec /tmp/payload ./...")).toBe(false)
+		expect(isAutoFallbackBash("npm test --script-shell=/tmp/payload")).toBe(
+			false,
+		)
+	})
+
+	it("still allows bounded fallback commands with normal args", () => {
+		expect(isAutoFallbackBash("go test ./...")).toBe(true)
+		expect(isAutoFallbackBash("vitest run")).toBe(true)
+		expect(isAutoFallbackBash("cmake --build .")).toBe(true)
+		expect(isAutoFallbackBash("pytest tests/unit")).toBe(true)
+	})
+
+	it("rejects outside-cwd targets in fallback test commands", () => {
+		expect(isAutoFallbackBash("pytest /tmp/evil.py")).toBe(false)
+		expect(
+			isAutoFallbackBash("cargo test --manifest-path /tmp/evil/Cargo.toml"),
+		).toBe(false)
+		expect(isAutoFallbackBash("go test -o /tmp/testbin")).toBe(false)
+		expect(isAutoFallbackBash('go test -o "/tmp/testbin"')).toBe(false)
+		expect(
+			isAutoFallbackBash('cargo test --manifest-path "/tmp/evil/Cargo.toml"'),
+		).toBe(false)
+		expect(isAutoFallbackBash("vitest --root=../evil")).toBe(false)
+		expect(isAutoFallbackBash("jest --testEnvironment=/tmp/evil.js")).toBe(
+			false,
+		)
+	})
+
+	it("rejects cmake install targets in fallback build commands", () => {
+		expect(isAutoFallbackBash("cmake --build . --target install")).toBe(false)
+	})
+
+	it("rejects nested shell execution", () => {
+		expect(
+			isSafeCommand('ls $(python -c "open(\'/tmp/x\',\'w\').write(\'x\')")'),
+		).toBe(false)
+	})
+
+	it("still rejects destructive compound commands", () => {
+		expect(isAutoFallbackBash("npm test; rm -rf /")).toBe(false)
+		expect(isAutoFallbackBash("ls; python -c \"open('/tmp/x','w').write('x')\"")).toBe(
+			false,
+		)
+	})
 });
 
 describe("isOutsideCwd", () => {
@@ -93,6 +203,16 @@ describe("isOutsideCwd", () => {
 
 	it("returns false for empty string (no path = inside cwd by default)", () => {
 		expect(isOutsideCwd("", cwd)).toBe(false);
+	});
+
+	it("treats symlinked in-cwd paths as outside when target resolves elsewhere", () => {
+		const root = mkdtempSync(join(tmpdir(), "pm-outside-sym-"))
+		const outside = mkdtempSync(join(tmpdir(), "pm-outside-target-"))
+		const linkPath = join(root, "link")
+		symlinkSync(outside, linkPath)
+		expect(isOutsideCwd("link/secret.txt", root)).toBe(true)
+		rmSync(root, { recursive: true, force: true })
+		rmSync(outside, { recursive: true, force: true })
 	});
 });
 
@@ -968,6 +1088,19 @@ describe("plan helpers", () => {
 		const tildePath = `~${planPath.slice(home.length)}`
 		expect(isPlanFilePath(tildePath, cwd)).toBe(true)
 	})
+
+	it("rejects symlinked plan file targets", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pm-plan-sym-"))
+		const planPath = getPlanFilePath(cwd)
+		mkdirSync(dirname(planPath), { recursive: true })
+		const outside = join(tmpdir(), `outside-plan-${Date.now()}.md`)
+		writeFileSync(outside, "outside")
+		symlinkSync(outside, planPath)
+		expect(isPlanFilePath(planPath, cwd)).toBe(false)
+		rmSync(cwd, { recursive: true, force: true })
+		rmSync(outside, { force: true })
+	})
+
 	it("shouldSyncAssistantPlanToFile guards hand-edited content", () => {
 		expect(shouldSyncAssistantPlanToFile(null)).toBe(true)
 		expect(shouldSyncAssistantPlanToFile("# My custom notes\nno plan header")).toBe(
@@ -997,6 +1130,21 @@ describe("checkAutoRisk", () => {
 		)
 		expect(
 			checkAutoRisk({ tool: "write", path: "/etc/hosts" }, cwd).match,
+		).toBe(true)
+	})
+
+	it("allows file-descriptor duplication in bash commands", () => {
+		expect(
+			checkAutoRisk({ tool: "bash", command: "npm test 2>&1" }, cwd).match,
+		).toBe(false)
+	})
+
+	it("blocks bash file redirects through >&", () => {
+		expect(
+			checkAutoRisk(
+				{ tool: "bash", command: "npm test >& /tmp/out.log" },
+				cwd,
+			).match,
 		).toBe(true)
 	})
 })

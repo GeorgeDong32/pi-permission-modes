@@ -32,7 +32,7 @@ Configure `~/.pi/agent/permission-modes.json`:
 }
 ```
 
-Built-in client supports Anthropic Messages, OpenAI Responses, and OpenAI-Compatible APIs. Does **not** import `@earendil-works/pi-ai`.
+Uses `completeSimple` from `@earendil-works/pi-ai/compat` with credentials from pi's `modelRegistry` — all built-in provider APIs (Anthropic, OpenAI, Azure, etc.) are supported automatically.
 
 ## Model profiles (v1.1.1)
 

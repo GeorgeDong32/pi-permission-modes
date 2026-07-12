@@ -129,6 +129,32 @@ describe("resolveModelForMode", () => {
 		const config: ModelProfilesConfig = { active: "missing" }
 		expect(resolveModelForMode(config, "ask")).toBeUndefined()
 	})
+
+	it("resolves model from ModeConfig object entry", () => {
+		const config: ModelProfilesConfig = {
+			active: "full",
+			full: {
+				bypass: {
+					model: "anthropic/claude-haiku-4-5",
+					skills: ["brainstorming"],
+				},
+			},
+		}
+		expect(resolveModelForMode(config, "bypass")).toBe(
+			"anthropic/claude-haiku-4-5",
+		)
+	})
+
+	it("inherits default profile model when active mode entry is partial", () => {
+		const config: ModelProfilesConfig = {
+			active: "custom",
+			custom: { plan: { skills: ["only-this"] } },
+			default: { plan: "anthropic/claude-sonnet-4-5" },
+		}
+		expect(resolveModelForMode(config, "plan")).toBe(
+			"anthropic/claude-sonnet-4-5",
+		)
+	})
 })
 
 // ---- getActiveProfileName ---------------------------------------------

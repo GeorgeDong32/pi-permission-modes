@@ -35,6 +35,7 @@ import {
   getPlanFilePath,
   hashPlan,
   injectModePrompt,
+  isAutoFallbackBash,
   isOutsideCwd,
   isPlanFilePath,
   isSafeCommand,
@@ -156,11 +157,6 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       path?: string;
     },
   ): Promise<Block> {
-    const risk = checkAutoRisk(riskInput, ctx.cwd);
-    if (risk.match) {
-      return blockAutoTier3(risk.reason, risk.category);
-    }
-
     let classifierAllowed = false;
     if (classifierConfig.enabled) {
       try {
@@ -170,6 +166,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
           pendingTool: { name: tool, input },
           registry: ctx.modelRegistry as any,
           timeoutMs: classifierConfig.timeoutMs,
+          signal: ctx.signal,
         });
         if (!verdict.allow) {
           return blockAutoTier3(
@@ -187,6 +184,11 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     }
 
     if (!classifierAllowed) {
+      const risk = checkAutoRisk(riskInput, ctx.cwd);
+      if (risk.match) {
+        return blockAutoTier3(risk.reason, risk.category);
+      }
+
       const isKnownTier3 =
         tool === "bash" || tool === "edit" || tool === "write";
       if (!isKnownTier3) {
@@ -197,7 +199,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       }
       if (tool === "bash") {
         const cmd = String(input.command ?? "");
-        if (cmd && !isSafeCommand(cmd)) {
+        if (cmd && !isAutoFallbackBash(cmd)) {
           return blockAutoTier3(
             `Mutating bash blocked in auto mode: ${cmd}`,
             "mutating-bash",
@@ -938,13 +940,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       return undefined;
     }
 
-    // PLAN EXECUTION: full tool access (legacy EXECUTING PLAN semantics).
-    if (planExecuting) {
-      if (tool === "edit" || tool === "write") {
-        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
-      }
-      return undefined;
-    }
+    // PLAN EXECUTION: use auto-mode tiered gate (classifier + blacklist).
+    // planExecuting only affects prompt injection and UI; it does not bypass auto.
 
     // PLAN: read-only except plan.md; bash allowlist only.
     if (currentMode === "plan") {
@@ -1344,6 +1341,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     applyToolRestrictions();
     if (planExecuting && planTodos.length) updatePlanWidget(ctx);
     if (currentMode === "ask") needsAskReminder = true;
+    if (currentMode === "bypass") needsBypassSecurityReminder = true;
     if (ctx.hasUI) {
       installFooter(ctx);
       updateStatus(ctx);

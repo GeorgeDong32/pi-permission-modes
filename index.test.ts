@@ -383,6 +383,12 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(result).toBeUndefined()
 		})
 
+		it("auto-approves npm test in fallback path", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", { command: "npm test" })
+			expect(result).toBeUndefined()
+		})
+
 		it("auto-approves read anywhere", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("read", { path: "/etc/passwd" })
@@ -1212,6 +1218,13 @@ describe("skill filtering in before_agent_start", () => {
 		expect(result?.systemPrompt).toContain("brainstorming")
 		expect(result?.systemPrompt).toContain("systematic-debugging")
 		expect(result?.systemPrompt).toContain("permission-modes:context")
+	})
+
+	it("injects bypass security reminder on session start", async () => {
+		permissionModesExtension(makeFakePiForExtension(pi))
+		const result = await triggerBeforeAgentStart("base prompt", "bypass")
+		expect(result?.systemPrompt).toContain("[Bypass]")
+		expect(result!.systemPrompt).toContain("auto-approved")
 	})
 
 	it("injects plan anchor in system prompt with skill filtering", async () => {

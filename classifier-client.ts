@@ -1,18 +1,30 @@
 /**
  * Built-in classifier LLM client for auto-mode tool-call review.
- * Does NOT import @earendil-works/pi-ai — only fetch + modelRegistry auth.
+ * Uses pi-ai completeSimple + ctx.modelRegistry auth resolution.
  */
 
-import { completeAnthropic } from "./classifier-providers/anthropic.ts"
-import { completeOpenAiCompatible } from "./classifier-providers/openai-compatible.ts"
-import { completeOpenAiResponses } from "./classifier-providers/openai-responses.ts"
-import type {
-	ClassifierModel,
-	ClassifierRegistry,
-	ProviderRequestOpts,
-} from "./classifier-providers/types.ts"
+import {
+	completeSimple,
+	type Api,
+	type Context,
+	type Model,
+} from "@earendil-works/pi-ai/compat"
 
 export type ClassifierVerdict = { allow: boolean; reason: string }
+
+export type ResolvedAuth =
+	| {
+			ok: true
+			apiKey?: string
+			headers?: Record<string, string>
+			env?: Record<string, string>
+	  }
+	| { ok: false; error: string }
+
+export interface ClassifierRegistry {
+	find(provider: string, modelId: string): Model<Api> | undefined
+	getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedAuth>
+}
 
 const CLASSIFIER_SYSTEM = `You are a security classifier for an AI coding agent.
 Review the pending tool call in context of the user's recent messages.
@@ -38,10 +50,11 @@ export function buildClassifierUserPrompt(
 ): string {
 	const recent = userMessages
 		.slice(-2)
-		.map(redactForClassifier)
+		.map((msg) => redactForClassifier(msg))
 		.join("\n---\n")
 	const toolJson = redactForClassifier(
 		JSON.stringify(pendingTool, null, 2),
+		8000,
 	)
 	return `Recent user messages:
 ${recent || "(none)"}
@@ -51,12 +64,30 @@ ${toolJson}`
 }
 
 /** Redact likely secrets before sending to classifier provider. */
-export function redactForClassifier(text: string): string {
-	return text
+export function redactForClassifier(
+	text: string,
+	limit = 4000,
+): string {
+	const redacted = text
 		.replace(/\bsk-[a-zA-Z0-9_-]{16,}\b/g, "sk-[REDACTED]")
 		.replace(/\bBearer\s+[A-Za-z0-9._-]+\b/gi, "Bearer [REDACTED]")
+		.replace(
+			/"((?:api[_-]?key|token|password))"\s*:\s*"[^"]*"/gi,
+			'"$1":"[REDACTED]"',
+		)
+		.replace(
+			/"((?:api[_-]?key|token|password))"\s*:\s*(?!")[^,\s}\]]+/gi,
+			'"$1":"[REDACTED]"',
+		)
 		.replace(/\b(api[_-]?key|token|password)\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
-		.slice(0, 4000)
+	if (!Number.isFinite(limit) || redacted.length <= limit) return redacted
+	const tailLen = Math.min(1000, Math.floor(limit / 3))
+	const headLen = limit - tailLen - 15
+	return (
+		redacted.slice(0, headLen) +
+		"\n...[truncated]...\n" +
+		redacted.slice(-tailLen)
+	)
 }
 
 export function parseClassifierVerdict(text: string): ClassifierVerdict | null {
@@ -86,31 +117,51 @@ export function parseClassifierVerdict(text: string): ClassifierVerdict | null {
 	}
 }
 
-async function dispatchCompletion(
-	model: ClassifierModel,
-	auth: ProviderRequestOpts["auth"],
-	systemPrompt: string,
+function extractTextContent(
+	content: Array<{ type: string; text?: string }>,
+): string {
+	return content
+		.filter((part) => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text!)
+		.join("\n")
+}
+
+async function runClassifierCompletion(
+	model: Model<Api>,
+	auth: Extract<ResolvedAuth, { ok: true }>,
 	userPrompt: string,
-	signal?: AbortSignal,
+	signal: AbortSignal,
+	timeoutMs: number,
 ): Promise<string> {
-	const opts: ProviderRequestOpts = {
-		model,
-		auth,
-		systemPrompt,
-		userPrompt,
+	const context: Context = {
+		systemPrompt: CLASSIFIER_SYSTEM,
+		messages: [
+			{
+				role: "user",
+				content: [{ type: "text", text: userPrompt }],
+				timestamp: Date.now(),
+			},
+		],
+	}
+
+	const response = await completeSimple(model, context, {
+		apiKey: auth.apiKey,
+		headers: auth.headers,
+		env: auth.env,
 		signal,
+		timeoutMs,
+		maxTokens: 256,
+		temperature: 0,
+	})
+
+	if (response.stopReason === "aborted") {
+		throw new Error("Classifier request aborted")
 	}
-	switch (model.api) {
-		case "anthropic-messages":
-			return completeAnthropic(opts)
-		case "openai-responses":
-		case "azure-openai-responses":
-			return completeOpenAiResponses(opts)
-		case "openai-completions":
-			return completeOpenAiCompatible(opts)
-		default:
-			throw new Error(`Unsupported classifier api: ${model.api}`)
+	if (response.stopReason === "error") {
+		throw new Error(response.errorMessage || "Classifier request failed")
 	}
+
+	return extractTextContent(response.content)
 }
 
 export async function classifyToolCall(opts: {
@@ -127,21 +178,21 @@ export async function classifyToolCall(opts: {
 	const model = opts.registry.find(parsed.provider, parsed.modelId)
 	if (!model) throw new Error(`Classifier model not found: ${opts.modelRef}`)
 
-	const auth = await opts.registry.getApiKeyAndHeaders(model)
-	if (!auth.ok) throw new Error(auth.error)
-
 	const controller = new AbortController()
 	const timeout = setTimeout(() => controller.abort(), opts.timeoutMs)
 	const onAbort = () => controller.abort()
 	opts.signal?.addEventListener("abort", onAbort)
 
 	try {
-		const text = await dispatchCompletion(
+		const auth = await opts.registry.getApiKeyAndHeaders(model)
+		if (!auth.ok) throw new Error(auth.error)
+
+		const text = await runClassifierCompletion(
 			model,
 			auth,
-			CLASSIFIER_SYSTEM,
 			buildClassifierUserPrompt(opts.userMessages, opts.pendingTool),
 			controller.signal,
+			opts.timeoutMs,
 		)
 		const verdict = parseClassifierVerdict(text)
 		if (!verdict) throw new Error("Classifier returned unparseable JSON")

@@ -4,7 +4,7 @@ Guide for coding agents working in this repository. Product context (goals, user
 features, success metrics): see [docs/PRD.md](docs/PRD.md).
 
 ## Summary
-A pi extension that implements Claude-Code-style permission modes (ask / plan / auto / bypass) for the pi coding agent, published on npm as `@georgedong32/permission-modes@2.0.0`. It intercepts tool calls, gates approvals per mode, injects minimal mode context via a system-prompt anchor, provides an adaptive live footer, guards reads outside cwd in ask mode, supports an optional built-in auto classifier (no pi-ai import), auto-switches the model per mode when the user has defined profiles in `~/.pi/agent/model-profiles.json`, tracks outside-cwd writes for undo (bypass mode), and supports per-mode skill filtering.
+A pi extension that implements Claude-Code-style permission modes (ask / plan / auto / bypass) for the pi coding agent, published on npm as `@georgedong32/permission-modes@2.0.0`. It intercepts tool calls, gates approvals per mode, injects minimal mode context via a system-prompt anchor, provides an adaptive live footer, guards reads outside cwd in ask mode, supports an optional built-in auto classifier (`completeSimple` via `@earendil-works/pi-ai/compat` + `ctx.modelRegistry` auth), auto-switches the model per mode when the user has defined profiles in `~/.pi/agent/model-profiles.json`, tracks outside-cwd writes for undo (bypass mode), and supports per-mode skill filtering.
 
 ## Tech Stack
 - **Language:** TypeScript (ESM — `"type": "module"`)
@@ -18,8 +18,7 @@ A pi extension that implements Claude-Code-style permission modes (ask / plan / 
 permission-modes/             # @georgedong32/permission-modes
 ├── package.json              # pi manifest + npm package metadata
 ├── index.ts                  # main extension — default-exported factory function
-├── classifier-client.ts      # built-in auto classifier (fetch + modelRegistry; no pi-ai import)
-├── classifier-providers/     # anthropic / openai-responses / openai-completions adapters
+├── classifier-client.ts      # built-in auto classifier (pi-ai completeSimple + modelRegistry auth)
 ├── config.ts                 # ~/.pi/agent/permission-modes.json loader
 ├── profiles.ts               # model-profile config helpers (load, resolve, parse)
 ├── profiles.test.ts          # unit tests for profiles.ts (vitest)
@@ -84,7 +83,7 @@ permission-modes/             # @georgedong32/permission-modes
 - **Do NOT** add third-party runtime dependencies — peer deps only (pi-core + typebox)
 - **Do NOT** change pi's core behavior — only intercept tool calls via `pi.on("tool_call", ...)` and return `{ block: true, reason }` or `undefined`
 - **Do NOT** modify the model outside an explicit user-defined profile — `pi.setModel()` is only called when the user has opted in via `~/.pi/agent/model-profiles.json` (i.e. `activeProfile !== undefined`). When no profile is active, the extension works exactly as v1.1.0.
-- **Do NOT** `import "@earendil-works/pi-ai"` for the classifier — use `classifier-client.ts` + `ctx.modelRegistry` only
+- **Classifier** uses `@earendil-works/pi-ai/compat` `completeSimple` with credentials from `ctx.modelRegistry.getApiKeyAndHeaders()` — do not reimplement provider HTTP adapters
 - **Do NOT** block bypass-mode writes outside cwd — bypass auto-approves and tracks snapshots for undo
 - **Do NOT** filter skills via skill discovery or resource events — use `filterSkillsFromPrompt()` in `before_agent_start` to strip disallowed skill XML blocks from the system prompt string
 - **Do NOT** inject per-turn `modes-context` messages — mode hints go in the `<!-- permission-modes:context -->` system prompt anchor via `injectModePrompt()`

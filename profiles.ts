@@ -171,17 +171,30 @@ export function ensureModelProfilesConfig(): ModelProfilesConfig {
 /**
  * Resolve the model ID string for a given mode from the active profile.
  * Falls back to the `default` profile when the active one doesn't define
- * that mode. Returns `undefined` when nothing matches.
+ * that mode's model (including partial mode objects with only skills/tools).
+ * Returns `undefined` when nothing matches.
  */
+function modelFromProfileEntry(
+	entry: string | ModeConfig | undefined,
+): string | undefined {
+	if (entry === undefined) return undefined
+	if (typeof entry === "string") return entry
+	return entry.model
+}
+
 export function resolveModelForMode(
 	config: ModelProfilesConfig,
 	mode: "ask" | "plan" | "auto" | "bypass",
 ): string | undefined {
 	const profileName = config.active || "default"
 	const profile = config[profileName] as ModelProfile | undefined
-	const def = config["default"] as ModelProfile | undefined
-	if (profile && typeof profile[mode] === "string") return profile[mode]
-	if (def && typeof def[mode] === "string") return def[mode]
+	const fromActive = modelFromProfileEntry(profile?.[mode])
+	if (fromActive) return fromActive
+
+	if (profileName !== "default") {
+		const def = config["default"] as ModelProfile | undefined
+		return modelFromProfileEntry(def?.[mode])
+	}
 	return undefined
 }
 

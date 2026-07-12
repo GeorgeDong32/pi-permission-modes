@@ -10,7 +10,7 @@
  * Ported from pi's bundled `examples/extensions/plan-mode/utils.ts`.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs"
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync, unlinkSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import path from "node:path"
@@ -42,6 +42,10 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
 	/\bapt(-get)?\s+(install|remove|purge|update|upgrade)/i,
 	/\bbrew\s+(install|uninstall|upgrade)/i,
 	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone)/i,
+	/\bfind\b[^\n|;&]*\s-delete\b/i,
+	/\bfind\b[^\n|;&]*\s-exec\b/i,
+	/\bfind\b[^\n|;&]*\s-execdir\b/i,
+	/\bfind\b[^\n|;&]*\s-fexec\b/i,
 	/\bsudo\b/i,
 	/\bsu\b/i,
 	/\bkill\b/i,
@@ -108,11 +112,200 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*eza\b/,
 ];
 
-/** A command is "safe" iff it matches the allowlist AND no destructive pattern. */
+// Build/test commands allowed in auto-mode classifier fallback (after blacklist).
+const AUTO_FALLBACK_SCRIPT_NAMES =
+	"test|build|lint|check|typecheck|verify|coverage|unit|ci"
+const AUTO_FALLBACK_SCRIPT_TAIL = "(?:\\s|$)"
+const AUTO_FALLBACK_BASH_PATTERNS: RegExp[] = [
+	new RegExp(`^\\s*npm\\s+test${AUTO_FALLBACK_SCRIPT_TAIL}`, "i"),
+	new RegExp(
+		`^\\s*npm\\s+run\\s+(${AUTO_FALLBACK_SCRIPT_NAMES})${AUTO_FALLBACK_SCRIPT_TAIL}`,
+		"i",
+	),
+	new RegExp(
+		`^\\s*(pnpm|yarn|bun)\\s+run\\s+(${AUTO_FALLBACK_SCRIPT_NAMES})${AUTO_FALLBACK_SCRIPT_TAIL}`,
+		"i",
+	),
+	new RegExp(`^\\s*(pnpm|yarn|bun)\\s+test${AUTO_FALLBACK_SCRIPT_TAIL}`, "i"),
+	new RegExp(`^\\s*go\\s+test${AUTO_FALLBACK_SCRIPT_TAIL}`, "i"),
+	new RegExp(`^\\s*cargo\\s+test${AUTO_FALLBACK_SCRIPT_TAIL}`, "i"),
+	/^\s*make(\s+(test|check|build))?\s*$/i,
+	/^\s*cmake\s+--build\b/i,
+	new RegExp(`^\\s*pytest${AUTO_FALLBACK_SCRIPT_TAIL}`, "i"),
+	new RegExp(`^\\s*vitest${AUTO_FALLBACK_SCRIPT_TAIL}`, "i"),
+	new RegExp(`^\\s*jest${AUTO_FALLBACK_SCRIPT_TAIL}`, "i"),
+];
+
+// Flags that turn routine test/build commands into arbitrary execution vectors.
+const AUTO_FALLBACK_UNSAFE_ARG_PATTERNS: RegExp[] = [
+	/(?:^|\s)-exec(?:=|\s|$)/i,
+	/(?:^|\s)-toolexec(?:=|\s)/i,
+	/(?:^|\s)--script-shell(?:=|\s)/i,
+	/(?:^|\s)--node-options(?:=|\s)/i,
+	/(?:^|\s)--config(?:=|\s)/i,
+	/(?:^|\s)-c(?:=|\s+)\S/i,
+	/(?:^|\s)--runner(?:=|\s)/i,
+	/(?:^|\s)--preload(?:=|\s)/i,
+	/(?:^|\s)--require(?:=|\s)/i,
+	/(?:^|\s)--import(?:=|\s)/i,
+	/(?:^|\s)--setupFiles(?:=|\s)/i,
+	/(?:^|\s)--globalSetup(?:=|\s)/i,
+	/(?:^|\s)--globalTeardown(?:=|\s)/i,
+	/(?:^|\s)--target(?:=|\s+)(?:install|package|deploy)\b/i,
+	/\s--(?:\s|$)/,
+	/\bcmake\s+--build\b\s+(?:\/|~|\.\.)/i,
+];
+
+// Paths outside cwd in otherwise-routine test/build commands.
+const AUTO_FALLBACK_OUTSIDE_PATH_PATTERNS: RegExp[] = [
+	/(?:^|\s)-o(?:=|\s+)(?:(?:\/|~|\.\.)|["'](?:\/|~|\.\.))/i,
+	/(?:^|\s)--manifest-path(?:=|\s+)(?:(?:\/|~|\.\.)|["'](?:\/|~|\.\.))/i,
+	/(?:^|\s)--target(?:=|\s+)(?:(?:\/|~|\.\.)|["'](?:\/|~|\.\.))/i,
+	/(?:^|\s)--chdir(?:=|\s+)(?:(?:\/|~|\.\.)|["'](?:\/|~|\.\.))/i,
+	/(?:^|\s)--project-directory(?:=|\s+)(?:(?:\/|~|\.\.)|["'](?:\/|~|\.\.))/i,
+	/(?:^|\s)[\w-]+=(?:\/|~|\.\.)/,
+	/(?:^|\s|=)(?:\/[^\s]*|~\/[^\s]*|\.\.(?:\/[^\s]*)?)/,
+	/(?:^|\s)["'](?:\/|~|\.\.)[^"']*["']/,
+	/(?:^|\s)[\w-]+=["'](?:\/|~|\.\.)[^"']*["']/,
+];
+
+const NESTED_SHELL_PATTERNS: RegExp[] = [/`/, /\$\(/, /\$\{/, /<\(/, />\(/];
+
+function isCharEscaped(command: string, index: number): boolean {
+	let backslashes = 0
+	for (let j = index - 1; j >= 0 && command[j] === "\\"; j--) {
+		backslashes++
+	}
+	return backslashes % 2 === 1
+}
+
+/** Split compound shell commands into segments (best-effort; not a full shell parser). */
+export function splitShellSegments(command: string): string[] {
+	const segments: string[] = []
+	let current = ""
+	let quote: "'" | '"' | null = null
+
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i]!
+		if (quote) {
+			current += ch
+			if (ch === quote && (quote === "'" || !isCharEscaped(command, i))) {
+				quote = null
+			}
+			continue
+		}
+		if (ch === "'" || ch === '"') {
+			if (!isCharEscaped(command, i)) quote = ch
+			current += ch
+			continue
+		}
+		if (ch === ";" && !isCharEscaped(command, i)) {
+			if (current.trim()) segments.push(current.trim())
+			current = ""
+			continue
+		}
+		if (
+			(command.startsWith("&&", i) || command.startsWith("||", i)) &&
+			!isCharEscaped(command, i)
+		) {
+			if (current.trim()) segments.push(current.trim())
+			current = ""
+			i += 1
+			continue
+		}
+		if (ch === "|" && command[i + 1] !== "|" && !isCharEscaped(command, i)) {
+			if (current.trim()) segments.push(current.trim())
+			current = ""
+			continue
+		}
+		if (ch === "&" && command[i + 1] !== "&" && !isCharEscaped(command, i)) {
+			if (command[i - 1] === ">" || command[i + 1] === ">") {
+				current += ch
+				continue
+			}
+			if (current.trim()) segments.push(current.trim())
+			current = ""
+			continue
+		}
+		if (ch === "\n" && !isCharEscaped(command, i)) {
+			if (current.trim()) segments.push(current.trim())
+			current = ""
+			continue
+		}
+		current += ch
+	}
+
+	if (current.trim()) segments.push(current.trim())
+	return segments
+}
+
+function hasNestedShellExecution(command: string): boolean {
+	let quote: "'" | '"' | null = null
+	let scanText = ""
+
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i]!
+		if (quote === "'") {
+			if (ch === "'" && !isCharEscaped(command, i)) quote = null
+			continue
+		}
+		if (quote === '"') {
+			scanText += ch
+			if (ch === '"' && !isCharEscaped(command, i)) quote = null
+			continue
+		}
+		if (ch === "'" || ch === '"') {
+			if (!isCharEscaped(command, i)) {
+				quote = ch
+				if (ch === '"') scanText += ch
+				continue
+			}
+		}
+		scanText += ch
+	}
+
+	return NESTED_SHELL_PATTERNS.some((p) => p.test(scanText))
+}
+
+function isSafeSingleCommand(command: string): boolean {
+	if (hasNestedShellExecution(command)) return false
+	const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command))
+	const isSafe = SAFE_PATTERNS.some((p) => p.test(command))
+	return !isDestructive && isSafe
+}
+
+function hasUnsafeFallbackArgs(segment: string): boolean {
+	return AUTO_FALLBACK_UNSAFE_ARG_PATTERNS.some((p) => p.test(segment))
+}
+
+function hasOutsideCwdFallbackTargets(segment: string): boolean {
+	return AUTO_FALLBACK_OUTSIDE_PATH_PATTERNS.some((p) => p.test(segment))
+}
+
+function matchesAutoFallbackPattern(segment: string): boolean {
+	return (
+		AUTO_FALLBACK_BASH_PATTERNS.some((p) => p.test(segment)) &&
+		!hasUnsafeFallbackArgs(segment) &&
+		!hasOutsideCwdFallbackTargets(segment)
+	)
+}
+
+/** A command is "safe" iff every shell segment matches the allowlist AND none are destructive. */
 export function isSafeCommand(command: string): boolean {
-	const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command));
-	const isSafe = SAFE_PATTERNS.some((p) => p.test(command));
-	return !isDestructive && isSafe;
+	const segments = splitShellSegments(command)
+	if (segments.length === 0) return false
+	return segments.every(isSafeSingleCommand)
+}
+
+/** Auto-mode fallback after blacklist: safe read-only OR routine build/test commands. */
+export function isAutoFallbackBash(command: string): boolean {
+	const segments = splitShellSegments(command)
+	if (segments.length === 0) return false
+	return segments.every(
+		(seg) =>
+			!hasNestedShellExecution(seg) &&
+			(isSafeSingleCommand(seg) || matchesAutoFallbackPattern(seg)),
+	)
 }
 
 export interface TodoItem {
@@ -217,19 +410,43 @@ function expandUserPath(p: string): string {
  * Returns true iff `targetPath` resolves to a location outside `cwd`.
  *
  * Empty string is treated as "inside cwd" (no path = nothing to be outside of).
- * Absolute paths are compared against cwd; relative paths are resolved from cwd.
- * Does NOT resolve symlinks — same limitation as `path.resolve`.
+ * Lexical resolution is used first; symlink components under cwd are checked so
+ * a path like `link/file` cannot escape when `link` points outside cwd.
  */
 export function isOutsideCwd(targetPath: string, cwd: string): boolean {
-	if (!targetPath) return false;
-	const p = expandUserPath(targetPath);
+	if (!targetPath) return false
+	const p = expandUserPath(targetPath)
 	const resolved = path.isAbsolute(p)
 		? path.resolve(p)
-		: path.resolve(cwd, p);
-	const cwdAbs = path.resolve(cwd);
-	// Same dir or strictly inside cwd → not outside
-	if (resolved === cwdAbs) return false;
-	return !resolved.startsWith(cwdAbs + path.sep);
+		: path.resolve(cwd, p)
+	const cwdAbs = path.resolve(cwd)
+
+	if (resolved === cwdAbs) return false
+	if (!resolved.startsWith(cwdAbs + path.sep)) return true
+
+	return pathEscapesCwdViaSymlink(resolved, cwdAbs)
+}
+
+function pathEscapesCwdViaSymlink(target: string, cwdAbs: string): boolean {
+	try {
+		const realCwd = existsSync(cwdAbs) ? realpathSync(cwdAbs) : cwdAbs
+		let probe = target
+		while (probe === cwdAbs || probe.startsWith(cwdAbs + path.sep)) {
+			if (existsSync(probe)) {
+				const real = realpathSync(probe)
+				if (real === realCwd) return false
+				if (!real.startsWith(realCwd + path.sep) && real !== realCwd) {
+					return true
+				}
+			}
+			const parent = path.dirname(probe)
+			if (parent === probe) break
+			probe = parent
+		}
+		return false
+	} catch {
+		return false
+	}
 }
 
 /**
@@ -626,6 +843,7 @@ export function readPlanFile(cwd: string): string | null {
 }
 
 export function writePlanFile(cwd: string, content: string): void {
+	assertWritablePlanPath(cwd)
 	const filePath = getPlanFilePath(cwd)
 	mkdirSync(path.dirname(filePath), { recursive: true })
 	writeFileSync(filePath, content, { mode: 0o644 })
@@ -634,6 +852,7 @@ export function writePlanFile(cwd: string, content: string): void {
 export function ensurePlanFile(cwd: string): string {
 	const filePath = getPlanFilePath(cwd)
 	try {
+		assertWritablePlanPath(cwd)
 		if (!existsSync(filePath)) {
 			mkdirSync(path.dirname(filePath), { recursive: true })
 			writeFileSync(filePath, PLAN_FILE_TEMPLATE, { mode: 0o644 })
@@ -644,6 +863,21 @@ export function ensurePlanFile(cwd: string): string {
 	return filePath
 }
 
+function assertWritablePlanPath(cwd: string): void {
+	const planPath = path.resolve(getPlanFilePath(cwd))
+	const cwdResolved = path.resolve(cwd)
+	if (planPathHasSymlinkAncestor(planPath, cwdResolved)) {
+		throw new Error(`Refusing to write symlinked plan path: ${planPath}`)
+	}
+	try {
+		if (existsSync(planPath) && lstatSync(planPath).isSymbolicLink()) {
+			throw new Error(`Refusing to write symlinked plan file: ${planPath}`)
+		}
+	} catch (err) {
+		if (err instanceof Error && err.message.startsWith("Refusing")) throw err
+	}
+}
+
 export function resolveWorkspacePath(targetPath: string, cwd: string): string {
 	if (!targetPath) return path.resolve(cwd)
 	const p = expandUserPath(targetPath)
@@ -652,10 +886,33 @@ export function resolveWorkspacePath(targetPath: string, cwd: string): string {
 
 export function isPlanFilePath(targetPath: string, cwd: string): boolean {
 	if (!targetPath) return false
-	return (
-		resolveWorkspacePath(targetPath, cwd) ===
-		path.resolve(getPlanFilePath(cwd))
-	)
+	const resolved = resolveWorkspacePath(targetPath, cwd)
+	const planPath = path.resolve(getPlanFilePath(cwd))
+	if (resolved !== planPath) return false
+	if (planPathHasSymlinkAncestor(planPath, path.resolve(cwd))) return false
+	if (!existsSync(planPath)) return true
+	try {
+		return realpathSync(resolved) === realpathSync(planPath)
+	} catch {
+		return false
+	}
+}
+
+function planPathHasSymlinkAncestor(filePath: string, stopAt: string): boolean {
+	const stop = path.resolve(stopAt)
+	let current = path.resolve(filePath)
+	while (true) {
+		if (current === stop) break
+		try {
+			if (lstatSync(current).isSymbolicLink()) return true
+		} catch {
+			/* missing segment — ok while creating plan file */
+		}
+		const parent = path.dirname(current)
+		if (parent === current) break
+		current = parent
+	}
+	return false
 }
 
 export function isPlaceholderPlanItem(text: string): boolean {
@@ -690,12 +947,16 @@ const AUTO_RISK_PATTERNS: Array<{ category: string; pattern: RegExp }> = [
 	{ category: "delete", pattern: /\brmdir\b/i },
 	{ category: "delete", pattern: /\bshred\b/i },
 	{ category: "delete", pattern: /\bdd\b/i },
+	{ category: "delete", pattern: /\bfind\b[^\n|;&]*\s-delete\b/i },
+	{ category: "delete", pattern: /\bfind\b[^\n|;&]*\s-exec\b/i },
+	{ category: "delete", pattern: /\bfind\b[^\n|;&]*\s-execdir\b/i },
+	{ category: "delete", pattern: /\bfind\b[^\n|;&]*\s-fexec\b/i },
 	{ category: "destructive", pattern: /\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone)/i },
 	{ category: "destructive", pattern: /\bmv\b/i },
 	{ category: "destructive", pattern: /\bcp\b/i },
 	{ category: "destructive", pattern: /\bmkdir\b/i },
 	{ category: "destructive", pattern: /\btouch\b/i },
-	{ category: "destructive", pattern: /(^|[^<])>(?!>)/ },
+	{ category: "destructive", pattern: /\d?>(?!&\d)/ },
 	{ category: "destructive", pattern: />>/ },
 	{ category: "package-install", pattern: /\bnpm\s+(install|uninstall|update|ci|link|publish)/i },
 	{ category: "package-install", pattern: /\byarn\s+(add|remove|install|publish)/i },
