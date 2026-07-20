@@ -15,6 +15,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import permissionModesExtension from "./index.ts"
+import { setConfigPath } from "./config.ts"
+import { writeProjectPermissionsFile } from "./permissions-loader.ts"
 import { setModelsPath } from "./profiles.ts"
 import {
 	listTrackedOutsideWrites,
@@ -357,22 +359,59 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(result).toBeUndefined()
 		})
 
-		it("blocks destructive bash (tier 3 blacklist)", async () => {
+		it("prompts on destructive bash (tier 3)", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("bash", { command: "rm -rf ./build" })
 			expect(result).toMatchObject({ block: true })
 		})
 
-		it("blocks write outside cwd (tier 3 blacklist)", async () => {
+		it("allows destructive bash when user approves", async () => {
+			await switchMode("auto")
+			const result = await callToolCall(
+				"bash",
+				{ command: "rm .marker" },
+				{ select: async () => "Allow" },
+			)
+			expect(result).toBeUndefined()
+		})
+
+		it("prompts on write outside cwd (tier 3)", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("write", { path: "/tmp/outside.txt" })
 			expect(result).toMatchObject({ block: true })
 		})
 
-		it("blocks curl bash (network blacklist)", async () => {
+		it("allows write outside cwd when user approves", async () => {
+			await switchMode("auto")
+			const result = await callToolCall(
+				"write",
+				{ path: "/tmp/outside.txt" },
+				{ select: async () => "Allow" },
+			)
+			expect(result).toBeUndefined()
+		})
+
+		it("prompts on curl bash (network blacklist)", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("bash", {
 				command: "curl https://example.com",
+			})
+			// curl is in the read-only SAFE_PATTERNS list → tier 1.5 auto-approve
+			expect(result).toBeUndefined()
+		})
+
+		it("auto-approves npm install via isAutoApprovableBash", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "npm install lodash",
+			})
+			expect(result).toBeUndefined()
+		})
+
+		it("prompts on dangerous bash not covered by auto-approvable", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "rm -rf node_modules",
 			})
 			expect(result).toMatchObject({ block: true })
 		})
@@ -383,16 +422,82 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(result).toBeUndefined()
 		})
 
+		it("auto-approves safe read-only bash (node --version)", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "node --version",
+			})
+			expect(result).toBeUndefined()
+		})
+
+		it("still prompts on safe+mutating compound bash", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "grep foo bar & npm i",
+			})
+			expect(result).toMatchObject({ block: true })
+		})
+
 		it("auto-approves npm test in fallback path", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("bash", { command: "npm test" })
 			expect(result).toBeUndefined()
 		})
 
-		it("auto-approves read anywhere", async () => {
+		it("auto-approves read outside cwd for non-sensitive paths", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("read", { path: "/etc/passwd" })
 			expect(result).toBeUndefined()
+		})
+
+		it("prompts on read of sensitive paths", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("read", { path: ".git/config" })
+			expect(result).toMatchObject({ block: true })
+		})
+
+		it("prompts on bash touching .git", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "cat .git/config",
+			})
+			expect(result).toMatchObject({ block: true })
+		})
+	})
+
+	describe("permission rules", () => {
+		let configTmp: string
+
+		beforeEach(() => {
+			configTmp = mkdtempSync(join(tmpdir(), "pm-idx-perm-"))
+			setConfigPath(join(configTmp, "permission-modes.json"))
+		})
+
+		it("allow rule bypasses auto-mode prompt for matching bash", async () => {
+			writeProjectPermissionsFile(realProjectRoot, {
+				allow: ["Bash(npm install *)"],
+			})
+			await pi.simulateSessionStart(realProjectRoot)
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "npm install -g @scope/pkg",
+			})
+			expect(result).toBeUndefined()
+		})
+
+		it("deny rule blocks before mode gate", async () => {
+			writeProjectPermissionsFile(realProjectRoot, {
+				deny: ["Bash(curl *)"],
+			})
+			await pi.simulateSessionStart(realProjectRoot)
+			await switchMode("auto")
+			const result = await callToolCall("bash", {
+				command: "curl https://example.com",
+			})
+			expect(result).toMatchObject({ block: true })
+			expect(String((result as { reason?: string })?.reason)).toContain(
+				"Denied by permission rule",
+			)
 		})
 	})
 

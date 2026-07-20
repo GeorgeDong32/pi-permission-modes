@@ -18,13 +18,30 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os";
 import path from "node:path";
-import { classifyToolCall } from "./classifier-client.ts";
+import {
+  classifyToolCall,
+  readAgentsMdForClassifier,
+  type ClassifierSessionContext,
+} from "./classifier-client.ts";
 import {
   loadPermissionModesConfig,
+  resolveAutoModeConfig,
   resolveClassifierConfig,
 } from "./config.ts";
 import {
+  addPermissionRule,
+  loadMergedPermissionRules,
+  warnIfLocalPermissionsNotGitignored,
+} from "./permissions-loader.ts";
+import {
+  evaluateToolPermission,
+  formatMergedRulesForDisplay,
+  suggestAllowRuleForToolCall,
+  type PermissionRule,
+} from "./permissions.ts";
+import {
   checkAutoRisk,
+  commandReferencesSensitivePath,
   ensurePlanFile,
   extractPlanSection,
   extractTodoItems,
@@ -36,9 +53,11 @@ import {
   hashPlan,
   injectModePrompt,
   isAutoFallbackBash,
+  isAutoApprovableBash,
   isOutsideCwd,
   isPlanFilePath,
   isSafeCommand,
+  isSensitivePath,
   listTrackedOutsideWrites,
   markCompletedSteps,
   popTrackedOutsideWrite,
@@ -98,6 +117,14 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   let planTodos: TodoItem[] = [];
   let projectRoot: string | null = null;
   let classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
+  let autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
+  let mergedPermissionRules: PermissionRule[] = [];
+  let classifierConsecutiveFailures = 0;
+  const MAX_CLASSIFIER_FAILURES = 3;
+
+  function reloadMergedPermissionRules(cwd: string): void {
+    mergedPermissionRules = loadMergedPermissionRules(cwd);
+  }
 
   // ---- model-profile state -----------------------------------------------
   // activeProfile === undefined means "no profile active" — the extension
@@ -138,13 +165,85 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     });
   }
 
-  function blockAutoTier3(
+  async function promptWithPermissionOptions(
+    ctx: ExtensionContext,
+    tool: string,
+    input: Record<string, unknown>,
+    label: string,
+    category: string,
+  ): Promise<Block> {
+    if (!ctx.hasUI) {
+      pendingComplianceInject = true;
+      complianceCategory = category;
+      return {
+        block: true,
+        reason: `${tool} needs approval: no UI available. ${label}`,
+      };
+    }
+    const choice = await ctx.ui.select(`Allow ${tool}? ${label}`, [
+      "Allow",
+      "Allow always (this project)",
+      "Allow always (global)",
+      "Block",
+    ]);
+    if (choice === "Allow always (this project)") {
+      const rule = suggestAllowRuleForToolCall(tool, input, ctx.cwd);
+      if (
+        addPermissionRule({
+          rule,
+          behavior: "allow",
+          destination: "local",
+          cwd: ctx.cwd,
+        })
+      ) {
+        reloadMergedPermissionRules(ctx.cwd);
+        warnIfLocalPermissionsNotGitignored(ctx.cwd, (msg) =>
+          ctx.ui.notify(msg, "warning"),
+        );
+        ctx.ui.notify(`Added allow rule (project local): ${rule}`);
+      }
+      if (tool === "edit" || tool === "write") {
+        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+      }
+      return undefined;
+    }
+    if (choice === "Allow always (global)") {
+      const rule = suggestAllowRuleForToolCall(tool, input, ctx.cwd);
+      if (
+        addPermissionRule({
+          rule,
+          behavior: "allow",
+          destination: "global",
+          cwd: ctx.cwd,
+        })
+      ) {
+        reloadMergedPermissionRules(ctx.cwd);
+        ctx.ui.notify(`Added allow rule (global): ${rule}`);
+      }
+      if (tool === "edit" || tool === "write") {
+        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+      }
+      return undefined;
+    }
+    if (choice !== "Allow") {
+      pendingComplianceInject = true;
+      complianceCategory = category;
+      return { block: true, reason: `${tool} blocked by user` };
+    }
+    if (tool === "edit" || tool === "write") {
+      trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+    }
+    return undefined;
+  }
+
+  async function promptAutoTier3(
+    ctx: ExtensionContext,
+    tool: string,
+    input: Record<string, unknown>,
     reason: string,
     category: string,
-  ): Block {
-    pendingComplianceInject = true;
-    complianceCategory = category;
-    return { block: true, reason };
+  ): Promise<Block> {
+    return promptWithPermissionOptions(ctx, tool, input, reason, category);
   }
 
   async function approveAutoTier3(
@@ -158,27 +257,48 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     },
   ): Promise<Block> {
     let classifierAllowed = false;
+    const reviewHint = describeTier3Review(tool, input, ctx.cwd);
     if (classifierConfig.enabled) {
       try {
         const verdict = await classifyToolCall({
           modelRef: classifierConfig.model,
-          userMessages: collectRecentUserMessages(ctx),
+          session: collectClassifierSessionContext(ctx, reviewHint),
           pendingTool: { name: tool, input },
           registry: ctx.modelRegistry as any,
+          autoMode: autoModeConfig,
           timeoutMs: classifierConfig.timeoutMs,
+          jsonlTranscript: classifierConfig.jsonlTranscript,
           signal: ctx.signal,
+          debug: process.env.PERMISSION_MODES_CLASSIFIER_DEBUG === "1",
         });
         if (!verdict.allow) {
-          return blockAutoTier3(
+          return promptAutoTier3(
+            ctx,
+            tool,
+            input,
             verdict.reason || "Blocked by auto classifier",
             "classifier",
           );
         }
         classifierAllowed = true;
+        classifierConsecutiveFailures = 0;
       } catch (err) {
+        classifierConsecutiveFailures++;
         console.warn(
-          "[permission-modes] Classifier failed, falling back to blacklist:",
+          `[permission-modes] Classifier unavailable (${classifierConsecutiveFailures}/${MAX_CLASSIFIER_FAILURES}):`,
           err,
+        );
+        // Fallback: check local auto-approvable rules before prompting.
+        const fallbackCmd = tool === "bash" ? String(input.command ?? "") : "";
+        if (fallbackCmd && isAutoApprovableBash(fallbackCmd)) {
+          return undefined;
+        }
+        return promptAutoTier3(
+          ctx,
+          tool,
+          input,
+          `Classifier unavailable: ${err instanceof Error ? err.message : String(err)}`,
+          "classifier-unavailable",
         );
       }
     }
@@ -186,13 +306,16 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     if (!classifierAllowed) {
       const risk = checkAutoRisk(riskInput, ctx.cwd);
       if (risk.match) {
-        return blockAutoTier3(risk.reason, risk.category);
+        return promptAutoTier3(ctx, tool, input, risk.reason, risk.category);
       }
 
       const isKnownTier3 =
         tool === "bash" || tool === "edit" || tool === "write";
       if (!isKnownTier3) {
-        return blockAutoTier3(
+        return promptAutoTier3(
+          ctx,
+          tool,
+          input,
           `Tool "${tool}" is not auto-approved in auto mode. Enable classifier or switch to bypass.`,
           "unknown-tool",
         );
@@ -200,8 +323,11 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       if (tool === "bash") {
         const cmd = String(input.command ?? "");
         if (cmd && !isAutoFallbackBash(cmd)) {
-          return blockAutoTier3(
-            `Mutating bash blocked in auto mode: ${cmd}`,
+          return promptAutoTier3(
+            ctx,
+            tool,
+            input,
+            `Mutating bash in auto mode: ${cmd}`,
             "mutating-bash",
           );
         }
@@ -241,29 +367,45 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     }
   }
 
-  function collectRecentUserMessages(ctx: ExtensionContext): string[] {
-    try {
-      const branch = (ctx.sessionManager as any).getBranch?.() ?? [];
-      const texts: string[] = [];
-      for (const entry of branch) {
-        if (entry?.type !== "message") continue;
-        const msg = entry.message;
-        if (msg?.role !== "user") continue;
-        if (typeof msg.content === "string" && msg.content.trim()) {
-          texts.push(msg.content.trim());
-        } else if (Array.isArray(msg.content)) {
-          const t = msg.content
-            .filter((c: any) => c?.type === "text")
-            .map((c: any) => c.text)
-            .join("\n")
-            .trim();
-          if (t) texts.push(t);
-        }
+  function describeTier3Review(
+    tool: string,
+    input: Record<string, unknown>,
+    cwd: string,
+  ): string {
+    if (tool === "bash") {
+      const cmd = String(input.command ?? "");
+      if (cmd && !isSafeCommand(cmd)) {
+        return "Bash did not pass read-only allowlist; may include writes, installs, or unknown binaries.";
       }
-      return texts;
-    } catch {
-      return [];
+      return "Bash requires tier-3 review.";
     }
+    if (tool === "edit" || tool === "write") {
+      const pathStr = String(input.path ?? "");
+      if (pathStr && isOutsideCwd(pathStr, cwd)) {
+        return `Write/edit outside working directory (${cwd}).`;
+      }
+      return "File write/edit requires tier-3 review.";
+    }
+    return `Tool "${tool}" is not auto-approved without classifier.`;
+  }
+
+  function collectClassifierSessionContext(
+    ctx: ExtensionContext,
+    reviewHint?: string,
+  ): ClassifierSessionContext {
+    let branch: ClassifierSessionContext["branch"] = [];
+    try {
+      branch = (ctx.sessionManager as any).getBranch?.() ?? [];
+    } catch {
+      // classifier still runs with pending action only
+    }
+    return {
+      cwd: ctx.cwd,
+      mode: currentMode,
+      branch,
+      reviewHint,
+      agentsMd: readAgentsMdForClassifier(ctx.cwd),
+    };
   }
 
   // ---- tool gating -------------------------------------------------------
@@ -407,11 +549,6 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   function updateStatus(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
     ctx.ui.setStatus("modes", undefined);
-    const m = MODE_META[currentMode];
-    ctx.ui.setWorkingIndicator({
-      frames: [ctx.ui.theme.fg(m.role, "●")],
-      intervalMs: 500,
-    });
   }
 
   function shortenPath(p: string): string {
@@ -563,8 +700,43 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   function refreshWorkingMessage(ctx: ExtensionContext): void {
     if (!ctx.hasUI) return;
     ctx.ui.setWorkingMessage(
-      ctx.ui.theme.fg(MODE_META[currentMode].role, renderWorkingMessage(ctx)),
+      ctx.ui.theme.fg("dim", renderWorkingMessage(ctx)),
     );
+  }
+
+  async function applyConfiguredPermissionRules(
+    ctx: ExtensionContext,
+    tool: string,
+    input: Record<string, unknown>,
+  ): Promise<Block | "allow" | "passthrough"> {
+    const verdict = evaluateToolPermission(
+      tool,
+      input,
+      ctx.cwd,
+      mergedPermissionRules,
+    );
+    if (verdict.behavior === "deny") {
+      return {
+        block: true,
+        reason: `Denied by permission rule [${verdict.source}]: ${verdict.rule}`,
+      };
+    }
+    if (verdict.behavior === "allow") {
+      if (tool === "edit" || tool === "write") {
+        trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+      }
+      return "allow";
+    }
+    if (verdict.behavior === "ask") {
+      return promptAutoTier3(
+        ctx,
+        tool,
+        input,
+        `permission rule requires approval: ${verdict.rule}`,
+        "permission-ask",
+      );
+    }
+    return "passthrough";
   }
 
   // ---- prompts -----------------------------------------------------------
@@ -572,19 +744,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
     tool: string,
     label: string,
+    input: Record<string, unknown> = {},
   ): Promise<Block> {
-    if (!ctx.hasUI)
-      return {
-        block: true,
-        reason: `${tool} blocked: no UI available to confirm.`,
-      };
-    const choice = await ctx.ui.select(`Allow ${tool} ${label}?`, [
-      "Allow",
-      "Block",
-    ]);
-    if (choice !== "Allow")
-      return { block: true, reason: `${tool} blocked by user` };
-    return undefined;
+    return promptWithPermissionOptions(ctx, tool, input, label, "user-prompt");
   }
 
   // ---- commands / shortcut / flag ---------------------------------------
@@ -594,6 +756,27 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       handler: async (_args, ctx) => setMode(mode, ctx),
     });
   }
+
+  pi.registerCommand("permissions", {
+    description:
+      "List merged permission rules (allow/deny/ask) from global + project config",
+    handler: async (_args, ctx) => {
+      reloadMergedPermissionRules(ctx.cwd);
+      const text = formatMergedRulesForDisplay(mergedPermissionRules);
+      if (ctx.hasUI) {
+        pi.sendMessage(
+          {
+            customType: "permissions-list",
+            content: `**Permission rules**\n\n\`\`\`\n${text}\n\`\`\``,
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      } else {
+        console.log(text);
+      }
+    },
+  });
 
   pi.registerCommand("mode", {
     description:
@@ -926,6 +1109,18 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     type: "string",
   });
 
+  /** Simple glob-style pattern matching for autoMode.allow / soft_deny rules. */
+  function matchAutoModePattern(command: string, pattern: string): boolean {
+    const trimmed = command.trim();
+    const p = pattern.trim();
+    if (trimmed === p) return true;
+    if (p.endsWith("*")) {
+      const prefix = p.slice(0, -1).trim();
+      return trimmed.startsWith(prefix);
+    }
+    return trimmed.includes(p);
+  }
+
   // ---- tool_call gate ----------------------------------------------------
   pi.on("tool_call", async (event, ctx): Promise<Block> => {
     const tool = event.toolName;
@@ -939,6 +1134,10 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       }
       return undefined;
     }
+
+    const permResult = await applyConfiguredPermissionRules(ctx, tool, input);
+    if (permResult === "allow") return undefined;
+    if (permResult !== "passthrough") return permResult;
 
     // PLAN EXECUTION: use auto-mode tiered gate (classifier + blacklist).
     // planExecuting only affects prompt injection and UI; it does not bypass auto.
@@ -967,15 +1166,72 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       return undefined;
     }
 
-    // AUTO: tiered gate with blacklist + optional classifier
+    // AUTO: tiered gate with optional classifier + user prompts for risky ops
     if (currentMode === "auto") {
       if (tool === "read" || tool === "grep" || tool === "find" || tool === "ls") {
+        const pathStr = String(input.path ?? "");
+        if (pathStr && isSensitivePath(pathStr, ctx.cwd)) {
+          return promptAutoTier3(
+            ctx,
+            tool,
+            input,
+            `sensitive path "${pathStr}"`,
+            "sensitive-path",
+          );
+        }
         return undefined;
       }
 
       if (tool === "edit" || tool === "write") {
         const pathStr = String(input.path ?? "");
+        if (pathStr && isSensitivePath(pathStr, ctx.cwd)) {
+          return promptAutoTier3(
+            ctx,
+            tool,
+            input,
+            `sensitive path "${pathStr}"`,
+            "sensitive-path",
+          );
+        }
         if (!pathStr || !isOutsideCwd(pathStr, ctx.cwd)) {
+          return undefined;
+        }
+      }
+
+      if (tool === "bash") {
+        const cmd = String(input.command ?? "");
+        if (cmd && commandReferencesSensitivePath(cmd)) {
+          return promptAutoTier3(
+            ctx,
+            tool,
+            input,
+            `sensitive path in command: ${cmd}`,
+            "sensitive-path",
+          );
+        }
+        // Tier 1: read-only bash auto-approves.
+        if (cmd && isSafeCommand(cmd)) {
+          return undefined;
+        }
+        // Tier 1.5: autoMode.allow user rules short-circuit before classifier.
+        // Guard: compound commands (&&, ||, ;) must have ALL segments safe,
+        // preventing "npm install && rm -rf /" from being allowed by a "npm" rule.
+        if (cmd && autoModeConfig?.allow?.length) {
+          if (autoModeConfig.allow.some((p) => matchAutoModePattern(cmd, p))) {
+            if (isAutoApprovableBash(cmd)) {
+              return undefined;
+            }
+            // Pattern matched but command has dangerous segments → fall through
+          }
+        }
+        // Tier 1.5b: autoMode.soft_deny forces a prompt.
+        if (cmd && autoModeConfig?.soft_deny?.length) {
+          if (autoModeConfig.soft_deny.some((p) => matchAutoModePattern(cmd, p))) {
+            return promptAutoTier3(ctx, tool, input, "matched autoMode.soft_deny", "auto-deny");
+          }
+        }
+        // Tier 2: common dev workflow commands auto-approve without classifier.
+        if (cmd && isAutoApprovableBash(cmd)) {
           return undefined;
         }
       }
@@ -995,7 +1251,12 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       if (tool === "read" || tool === "grep" || tool === "find" || tool === "ls") {
         const pathStr = String(input.path ?? "");
         if (pathStr && isOutsideCwd(pathStr, ctx.cwd)) {
-          return promptApproval(ctx, tool, `outside cwd on "${pathStr}"`);
+          return promptApproval(
+            ctx,
+            tool,
+            `outside cwd on "${pathStr}"`,
+            input,
+          );
         }
         return undefined;
       }
@@ -1008,9 +1269,33 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
           };
         const choice = await ctx.ui.select(`Allow ${tool} on ${pathVal}?`, [
           "Allow",
+          "Allow always (this project)",
+          "Allow always (global)",
           "Allow all (enable bypass)",
           "Block",
         ]);
+        if (choice === "Allow always (this project)") {
+          const rule = suggestAllowRuleForToolCall(tool, input, ctx.cwd);
+          addPermissionRule({
+            rule,
+            behavior: "allow",
+            destination: "local",
+            cwd: ctx.cwd,
+          });
+          reloadMergedPermissionRules(ctx.cwd);
+          return undefined;
+        }
+        if (choice === "Allow always (global)") {
+          const rule = suggestAllowRuleForToolCall(tool, input, ctx.cwd);
+          addPermissionRule({
+            rule,
+            behavior: "allow",
+            destination: "global",
+            cwd: ctx.cwd,
+          });
+          reloadMergedPermissionRules(ctx.cwd);
+          return undefined;
+        }
         if (choice === "Allow all (enable bypass)") {
           await setMode("bypass", ctx);
           return undefined;
@@ -1022,7 +1307,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       if (tool === "bash") {
         const cmd = String(input.command ?? "");
         if (isSafeCommand(cmd)) return undefined;
-        return promptApproval(ctx, tool, `"${cmd}"`);
+        return promptApproval(ctx, tool, `"${cmd}"`, input);
       }
       return undefined;
     }
@@ -1033,6 +1318,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   // ---- context injection (system prompt anchor) --------------------------
   pi.on("before_agent_start", async (event, ctx) => {
     classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
+    autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
+    reloadMergedPermissionRules(ctx.cwd);
 
     const systemPromptBase =
       event?.systemPrompt ?? ctx?.getSystemPrompt?.() ?? "";
@@ -1271,6 +1558,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     // settings.json). Re-runs on /reload so a user-deleted file is recreated.
     modelProfileConfig = ensureModelProfilesConfig();
     classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
+    autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
+    reloadMergedPermissionRules(ctx.cwd);
 
     const flag = pi.getFlag("permission-mode");
     if (typeof flag === "string") {

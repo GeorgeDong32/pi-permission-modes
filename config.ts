@@ -7,14 +7,25 @@ import { existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
+import type { AutoModeRules } from "./classifier-prompt.ts"
+
 export interface ClassifierConfig {
 	enabled: boolean
 	model: string
 	timeoutMs: number
+	/** CC-style JSONL transcript lines instead of "User:" / "bash cmd" format. */
+	jsonlTranscript?: boolean
 }
 
 export interface PermissionModesConfig {
 	classifier?: Partial<ClassifierConfig>
+	/** CC auto-mode classifier allow / soft_deny / environment bullets. */
+	autoMode?: AutoModeRules
+	permissions?: {
+		allow?: string[]
+		deny?: string[]
+		ask?: string[]
+	}
 }
 
 let _configPath = join(homedir(), ".pi", "agent", "permission-modes.json")
@@ -28,9 +39,9 @@ export function setConfigPath(p: string): void {
 }
 
 const DEFAULT_CLASSIFIER: ClassifierConfig = {
-	enabled: false,
+	enabled: true,
 	model: "anthropic/claude-haiku-4-5",
-	timeoutMs: 8000,
+	timeoutMs: 5000,
 }
 
 export function resolveClassifierConfig(
@@ -41,7 +52,23 @@ export function resolveClassifierConfig(
 		enabled: c.enabled ?? DEFAULT_CLASSIFIER.enabled,
 		model: c.model ?? DEFAULT_CLASSIFIER.model,
 		timeoutMs: c.timeoutMs ?? DEFAULT_CLASSIFIER.timeoutMs,
+		jsonlTranscript: c.jsonlTranscript ?? false,
 	}
+}
+
+export function resolveAutoModeConfig(
+	config: PermissionModesConfig,
+): AutoModeRules | undefined {
+	const rules = config.autoMode
+	if (!rules) return undefined
+	if (
+		!rules.allow?.length &&
+		!rules.soft_deny?.length &&
+		!rules.environment?.length
+	) {
+		return undefined
+	}
+	return rules
 }
 
 export function loadPermissionModesConfig(): PermissionModesConfig {

@@ -100,6 +100,7 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*npm\s+(list|ls|view|info|search|outdated|audit)/i,
 	/^\s*yarn\s+(list|info|why|audit)/i,
 	/^\s*node\s+--version/i,
+	/^\s*node\s+-v\b/i,
 	/^\s*python\s+--version/i,
 	/^\s*curl\s/i,
 	/^\s*wget\s+-O\s*-/i,
@@ -308,6 +309,94 @@ export function isAutoFallbackBash(command: string): boolean {
 	)
 }
 
+// ---------------------------------------------------------------------------
+// Auto-mode auto-approvable commands (broader than isAutoFallbackBash).
+// Common dev workflow commands with controlled side-effects that don't need
+// classifier review in auto mode.
+// ---------------------------------------------------------------------------
+
+const AUTO_APPROVABLE_PATTERNS: RegExp[] = [
+	// Package management (install/update dependencies)
+	/^\s*npm\s+(install|ci|update|link|dedupe|rebuild)\b/i,
+	/^\s*(pnpm|yarn|bun)\s+(install|add|update|link|dedupe|rebuild)\b/i,
+	// Build / run scripts
+	/^\s*npm\s+run\s+\S+/i,
+	/^\s*(pnpm|yarn|bun)\s+run\s+\S+/i,
+	/^\s*(make|cmake)\b/i,
+	/^\s*cargo\s+(build|check|clippy|fmt|test)\b/i,
+	/^\s*go\s+(build|vet|fmt|mod|test|run)\b/i,
+	// Git local write operations (no push/force)
+	/^\s*git\s+(add|commit|stash|branch|checkout|switch|tag|init|clone)\b/i,
+	/^\s*git\s+(merge|rebase|cherry-pick|revert|reset|restore)\b/i,
+	/^\s*git\s+(fetch|pull)\b/i,
+	// File operations
+	/^\s*mkdir\b/i,
+	/^\s*touch\b/i,
+	/^\s*cp\b/i,
+	/^\s*mv\b/i,
+	// Code formatting / linting / type-checking
+	/^\s*npx\s+(prettier|eslint|tsc|esbuild|vite|next|nuxt|astro)\b/i,
+	/^\s*(prettier|eslint|biome)\b/i,
+	/^\s*tsc\b/i,
+	// Test runners
+	/^\s*npm\s+test\b/i,
+	/^\s*(pnpm|yarn|bun)\s+test\b/i,
+	/^\s*(vitest|jest|mocha|ava|tap)\b/i,
+	/^\s*pytest\b/i,
+	/^\s*go\s+test\b/i,
+	/^\s*cargo\s+test\b/i,
+	// Misc safe dev tools
+	/^\s*node\s+\S+/i,
+	/^\s*python3?\s+\S+/i,
+	/^\s*docker\s+(build|compose|run|exec|logs|ps|images|pull)\b/i,
+];
+
+const AUTO_APPROVABLE_EXCLUDE: RegExp[] = [
+	/\brm\b/,
+	/\bsudo\b/,
+	/\bsu\b/,
+	/--force\b/,
+	/\s-f\b/,
+	/\bgit\s+push\b/,
+	/\bgit\s+reset\s+--hard\b/,
+	/\bgit\s+clean\b/,
+	/\bnpm\s+publish\b/,
+	/\b--exec\b/,
+	/\b-exec\b/,
+	/\bexec\b/,
+	/\bkill\b/,
+	/\bpkill\b/,
+	/\bkillall\b/,
+	/\breboot\b/,
+	/\bshutdown\b/,
+	/\bdd\b/,
+	/\bshred\b/,
+	/\bchmod\b/,
+	/\bchown\b/,
+	/>/,
+];
+
+function isAutoApprovableSingleCommand(command: string): boolean {
+	if (hasNestedShellExecution(command)) return false
+	if (AUTO_APPROVABLE_EXCLUDE.some((p) => p.test(command))) return false
+	return AUTO_APPROVABLE_PATTERNS.some((p) => p.test(command))
+}
+
+/**
+ * Broader auto-mode check: approves common dev workflow commands (package
+ * installs, builds, git local ops, file ops) without classifier review.
+ * Every shell segment must be approvable and no segment may be dangerous.
+ */
+export function isAutoApprovableBash(command: string): boolean {
+	const segments = splitShellSegments(command)
+	if (segments.length === 0) return false
+	return segments.every(
+		(seg) =>
+			!hasNestedShellExecution(seg) &&
+			(isSafeSingleCommand(seg) || isAutoApprovableSingleCommand(seg)),
+	)
+}
+
 export interface TodoItem {
 	step: number;
 	text: string;
@@ -475,6 +564,41 @@ export function commandTargetsOutsideCwd(command: string, cwd: string): boolean 
 	if (/(^|[\s;&|(])\.\.($|[\s/&|)])/.test(command)) return true;
 
 	return false;
+}
+
+const SENSITIVE_DIR_NAMES = new Set([".git"])
+const SENSITIVE_FILE_PATTERN =
+	/^\.env(?:\.|$)|^id_rsa$|^id_ed25519$|^credentials$/
+
+function pathHasSensitiveSegment(resolvedPath: string): boolean {
+	const parts = resolvedPath.split(path.sep)
+	for (const part of parts) {
+		if (SENSITIVE_DIR_NAMES.has(part)) return true
+		if (SENSITIVE_FILE_PATTERN.test(part)) return true
+	}
+	return false
+}
+
+/** True when a tool path targets .git, .env*, SSH keys, or similar sensitive locations. */
+export function isSensitivePath(targetPath: string, cwd: string): boolean {
+	if (!targetPath) return false
+	const p = expandUserPath(targetPath)
+	const resolved = path.isAbsolute(p)
+		? path.resolve(p)
+		: path.resolve(cwd, p)
+	return pathHasSensitiveSegment(resolved)
+}
+
+/** Heuristic: does a bash command reference sensitive paths (.git, .env, ~/.ssh, etc.)? */
+export function commandReferencesSensitivePath(command: string): boolean {
+	if (!command.trim()) return false
+	if (/(?:^|[\s;&|('"[(])\.git(?:\/|\s|$|['")\]])/.test(command)) return true
+	if (/(?:^|[\s;&|('"[(])\.env(?:\.|\s|$|['")\]])/.test(command)) return true
+	if (/\bid_rsa\b/.test(command)) return true
+	if (/\bid_ed25519\b/.test(command)) return true
+	if (/(?:^|[\s;&|()])~\/\.ssh\b/.test(command)) return true
+	if (/(?:^|[\s;&|()])\$HOME\/\.ssh\b/.test(command)) return true
+	return false
 }
 
 /**
@@ -1003,7 +1127,7 @@ export function checkAutoRisk(
 				return {
 					match: true,
 					category,
-					reason: `Risky bash command blocked (${category}): ${cmd}`,
+					reason: `Risky bash (${category}): ${cmd}`,
 				}
 			}
 		}
@@ -1016,7 +1140,7 @@ export function checkAutoRisk(
 			return {
 				match: true,
 				category: "outside-cwd-write",
-				reason: `Write outside cwd blocked: ${pathStr}`,
+				reason: `Write outside cwd: ${pathStr}`,
 			}
 		}
 	}

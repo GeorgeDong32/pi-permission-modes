@@ -6,6 +6,7 @@ import { join, dirname } from "node:path";
 import { readdirSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import {
 	checkAutoRisk,
+	commandReferencesSensitivePath,
 	commandTargetsOutsideCwd,
 	ensurePlanFile,
 	extractPlanSection,
@@ -24,6 +25,7 @@ import {
 	isCompletionSignal,
 	isInsideProject,
 	isOutsideCwd,
+	isSensitivePath,
 	isPlanFilePath,
 	isPlaceholderPlanItem,
 	isSafeCommand,
@@ -1118,6 +1120,37 @@ describe("isOutsideCwd with tilde", () => {
 	it("treats ~/outside as outside project cwd", () => {
 		const cwd = join(homedir(), "project")
 		expect(isOutsideCwd("~/secrets.txt", cwd)).toBe(true)
+	})
+})
+
+describe("isSensitivePath", () => {
+	const cwd = "/home/user/project"
+
+	it("flags .git paths", () => {
+		expect(isSensitivePath(".git/config", cwd)).toBe(true)
+		expect(isSensitivePath("../other/.git/HEAD", cwd)).toBe(true)
+	})
+
+	it("flags .env files", () => {
+		expect(isSensitivePath(".env", cwd)).toBe(true)
+		expect(isSensitivePath(".env.local", cwd)).toBe(true)
+	})
+
+	it("allows ordinary project files", () => {
+		expect(isSensitivePath("src/foo.ts", cwd)).toBe(false)
+		expect(isSensitivePath("/etc/passwd", cwd)).toBe(false)
+	})
+})
+
+describe("commandReferencesSensitivePath", () => {
+	it("flags commands touching .git or .env", () => {
+		expect(commandReferencesSensitivePath("cat .git/config")).toBe(true)
+		expect(commandReferencesSensitivePath("grep foo .env")).toBe(true)
+	})
+
+	it("allows ordinary read-only commands", () => {
+		expect(commandReferencesSensitivePath("cat ~/.zshrc")).toBe(false)
+		expect(commandReferencesSensitivePath("git status")).toBe(false)
 	})
 })
 
