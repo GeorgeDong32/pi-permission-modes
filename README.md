@@ -34,6 +34,31 @@ Configure `~/.pi/agent/permission-modes.json`:
 
 Uses `completeSimple` from `@earendil-works/pi-ai/compat` with credentials from pi's `modelRegistry` — all built-in provider APIs (Anthropic, OpenAI, Azure, etc.) are supported automatically.
 
+### Permission rules (v2.1.0, CC-compatible)
+
+Configure **allow / deny / ask** rules in Claude Code syntax (`Tool` or `Tool(specifier)`). Rules merge across scopes; evaluation order is **deny → ask → allow** (deny cannot be overridden).
+
+| Scope | Path |
+|---|---|
+| Global | `~/.pi/agent/permission-modes.json` → `permissions` block |
+| Project (shareable) | `<cwd>/.pi/projects/<id>/permissions.json` |
+| Project local | `<cwd>/.pi/projects/<id>/permissions.local.json` (personal; add to `.gitignore`) |
+
+Example global config:
+
+```json
+{
+  "classifier": { "enabled": false },
+  "permissions": {
+    "allow": ["Bash(npm run test *)", "Read(~/.zshrc)"],
+    "deny": ["Bash(curl *)", "Read(./.env)", "Read(./.git/**)"],
+    "ask": ["Bash(npm install *)"]
+  }
+}
+```
+
+When a tool call would prompt, you can choose **Allow always (this project)** or **Allow always (global)** to persist an allow rule. Use `/permissions` to list the merged rule set.
+
 ## Model profiles (v1.1.1)
 
 Define named profiles in `~/.pi/agent/model-profiles.json` mapping each mode to a model ID:
@@ -72,6 +97,7 @@ If the file doesn't exist on first install, the extension creates it for you (pr
 | Shortcut | `Shift+Tab` | cycle modes |
 | Shortcut | `Alt+T` | cycle thinking level (off → minimal → low → medium → high → xhigh) |
 | Shortcut | `Alt+I` | cycle model profile (next profile from `~/.pi/agent/model-profiles.json`; re-applies the model for the current mode) |
+| Command | `/permissions` | list merged allow/deny/ask rules |
 | Command | `/outside-writes` | list tracked outside-cwd writes (read-only) |
 | Command | `/undo-outside-writes` | restore outside-cwd writes (selector, `all`, or `--list`) |
 | Flag | `--permission-mode <name>` | start in a mode (accepts `ask`, `plan`, `auto`, or `default` as alias; default `ask`) |

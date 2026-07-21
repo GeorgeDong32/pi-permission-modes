@@ -1,6 +1,6 @@
 {
   "name": "@georgedong32/permission-modes",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "description": "Claude-Code-style permission modes (ask / plan / auto) for the pi coding agent — with per-mode model profiles, outside-cwd write tracking, and per-mode skill filtering.",
   "keywords": [
@@ -32,6 +32,7 @@
   },
   "files": [
     "*.ts",
+    "classifier-prompts/**",
     "README.md",
     "LICENSE"
   ],

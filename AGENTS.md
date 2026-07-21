@@ -4,7 +4,7 @@ Guide for coding agents working in this repository. Product context (goals, user
 features, success metrics): see [docs/PRD.md](docs/PRD.md).
 
 ## Summary
-A pi extension that implements Claude-Code-style permission modes (ask / plan / auto / bypass) for the pi coding agent, published on npm as `@georgedong32/permission-modes@2.0.0`. It intercepts tool calls, gates approvals per mode, injects minimal mode context via a system-prompt anchor, provides an adaptive live footer, guards reads outside cwd in ask mode, supports an optional built-in auto classifier (`completeSimple` via `@earendil-works/pi-ai/compat` + `ctx.modelRegistry` auth), auto-switches the model per mode when the user has defined profiles in `~/.pi/agent/model-profiles.json`, tracks outside-cwd writes for undo (bypass mode), and supports per-mode skill filtering.
+A pi extension that implements Claude-Code-style permission modes (ask / plan / auto / bypass) for the pi coding agent, published on npm as `@georgedong32/permission-modes@2.1.0`. It intercepts tool calls, gates approvals per mode, supports CC-compatible **allow/deny/ask** permission rules (global + per-project), injects minimal mode context via a system-prompt anchor, provides an adaptive live footer, guards reads outside cwd in ask mode, supports an optional built-in auto classifier (`completeSimple` via `@earendil-works/pi-ai/compat` + `ctx.modelRegistry` auth), auto-switches the model per mode when the user has defined profiles in `~/.pi/agent/model-profiles.json`, tracks outside-cwd writes for undo (bypass mode), and supports per-mode skill filtering.
 
 ## Tech Stack
 - **Language:** TypeScript (ESM — `"type": "module"`)
@@ -20,6 +20,12 @@ permission-modes/             # @georgedong32/permission-modes
 ├── index.ts                  # main extension — default-exported factory function
 ├── classifier-client.ts      # built-in auto classifier (pi-ai completeSimple + modelRegistry auth)
 ├── config.ts                 # ~/.pi/agent/permission-modes.json loader
+├── permissions.ts            # rule evaluation (deny → ask → allow)
+├── permissions-loader.ts     # global + project permissions.json merge/persist
+├── permission-rule-parser.ts # CC Tool(specifier) parse/serialize
+├── shell-rule-matching.ts    # bash exact/prefix/wildcard matching
+├── bash-permission-match.ts  # bash compound-command rule matching
+├── path-permission-match.ts  # Read/Edit/Write path glob matching
 ├── profiles.ts               # model-profile config helpers (load, resolve, parse)
 ├── profiles.test.ts          # unit tests for profiles.ts (vitest)
 ├── utils.ts                  # pure helpers: bash allowlist, Plan: extraction, [DONE:n] tracking
@@ -49,6 +55,8 @@ permission-modes/             # @georgedong32/permission-modes
 | Action | Command |
 |---|---|
 | Switch mode | `/ask`, `/plan`, `/auto`, `/bypass`, or `/mode` (`/default` works as alias) |
+| Permission rules | `~/.pi/agent/permission-modes.json` + `<cwd>/.pi/projects/<id>/permissions.json` |
+| List permission rules | `/permissions` |
 | Classifier config | `~/.pi/agent/permission-modes.json` (`classifier.enabled`, `classifier.model`, `classifier.timeoutMs`) |
 | Switch model profile | `/model-profile` (selector) or `/model-profile <name>`; `/model-profile list` to print all |
 | Undo outside-cwd writes | `/undo-outside-writes` (selector, `all`, or `--list`) |
@@ -90,10 +98,10 @@ permission-modes/             # @georgedong32/permission-modes
 - **Do NOT** ship partial tool filtering — `resolveToolFilter()` is currently a stub that only ensures `read` is mandatory. Full configurable tool filtering (wired into `tool_call`) is planned for a future release.
 - **Do NOT** duplicate content between AGENTS.md and CLAUDE.md — keep AGENTS.md as the single source of truth
 - **Safe to delete:** `.pi/permission-modes-45ea0551.md` (recreated automatically)
-- **Invariants:** The four-mode cycle (ask → plan → auto → bypass) is hard-coded in `MODE_CYCLE`. Auto uses tiered gating + optional classifier + `AUTO_RISK_PATTERNS` blacklist. Plan mode only allows writes to `plan.md`. Classifier config path: `~/.pi/agent/permission-modes.json`. Model-profile path: `~/.pi/agent/model-profiles.json` (NOT `models.json`).
+- **Invariants:** The four-mode cycle (ask → plan → auto → bypass) is hard-coded in `MODE_CYCLE`. Configured permission rules evaluate **before** mode gate (bypass exempt): deny → ask → allow. Auto uses tiered gating + optional classifier + `AUTO_RISK_PATTERNS` blacklist. Plan mode only allows writes to `plan.md`. Classifier + global permissions path: `~/.pi/agent/permission-modes.json`. Project permissions: `<cwd>/.pi/projects/<id>/permissions.json` (+ `permissions.local.json`). Model-profile path: `~/.pi/agent/model-profiles.json` (NOT `models.json`).
 
 ## Known Issues & Gotchas
-- **Test infrastructure exists** — 201 tests across `index.test.ts`, `profiles.test.ts`, `utils.test.ts`, and `classifier-client.test.ts`. Always run `npm test` before committing non-trivial changes.
+- **Test infrastructure exists** — 275 tests across `index.test.ts`, `profiles.test.ts`, `utils.test.ts`, `classifier-client.test.ts`, and permission rule modules. Always run `npm test` before committing non-trivial changes.
 - **Snapshot cap at 100:** Long-running sessions in bypass mode that touch >100 outside-cwd paths will LRU-evict oldest snapshots.
 - The `--permission-mode` flag uses a distinct name because pi has a built-in `--mode` flag for output format (text/json/rpc). Do not rename it to `--mode`.
 - Auto mode **does not** send per-turn Continue follow-ups (removed in v2.0.0).
@@ -110,6 +118,6 @@ permission-modes/             # @georgedong32/permission-modes
 - **memory (@aprimediet/memory):** Active (8+ entries). Durable facts are stored at `~/.pi/projects/permission-modes-45ea0551/memory/`. Use `memory_write` to save decisions/gotchas and `memory_search` to recall context.
 
 ## Current Focus
-- **v2.0.0** released — four modes, built-in classifier, plan.md driver, anchor injection, 201 tests
-- **Next** — tool filtering (`resolveToolFilter` + `tool_call`), `/mode-config` command
+- **v2.1.0** released — CC-style allow/deny/ask rules, `/permissions`, allow-always persistence, 275 tests
+- **Next** — tool filtering (`resolveToolFilter` + `tool_call`), `/permissions add|remove` selectors
 - See [CHANGELOG.md](CHANGELOG.md) for full release history

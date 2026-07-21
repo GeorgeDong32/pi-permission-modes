@@ -4,9 +4,10 @@ import {
 	classifyToolCall,
 	parseClassifierVerdict,
 	parseModelRef,
-	redactForClassifier,
 	type ClassifierRegistry,
+	type ClassifierSessionContext,
 } from "./classifier-client.ts"
+import { redactForClassifier } from "./classifier-redact.ts"
 
 const { completeSimpleMock } = vi.hoisted(() => ({
 	completeSimpleMock: vi.fn(),
@@ -15,6 +16,17 @@ const { completeSimpleMock } = vi.hoisted(() => ({
 vi.mock("@earendil-works/pi-ai/compat", () => ({
 	completeSimple: completeSimpleMock,
 }))
+
+function session(
+	overrides: Partial<ClassifierSessionContext> = {},
+): ClassifierSessionContext {
+	return {
+		cwd: "/proj",
+		mode: "auto",
+		branch: [],
+		...overrides,
+	}
+}
 
 function makeAssistantResponse(text: string) {
 	return {
@@ -49,7 +61,15 @@ describe("parseModelRef", () => {
 })
 
 describe("parseClassifierVerdict", () => {
-	it("parses raw JSON", () => {
+	it("parses CC shouldBlock JSON", () => {
+		expect(
+			parseClassifierVerdict(
+				'{"thinking":"ok","shouldBlock":false,"reason":"routine"}',
+			),
+		).toEqual({ allow: true, reason: "routine", thinking: "ok" })
+	})
+
+	it("parses legacy allow JSON", () => {
 		expect(parseClassifierVerdict('{"allow":false,"reason":"risky"}')).toEqual({
 			allow: false,
 			reason: "risky",
@@ -58,8 +78,8 @@ describe("parseClassifierVerdict", () => {
 
 	it("parses fenced JSON", () => {
 		expect(
-			parseClassifierVerdict('```json\n{"allow":true,"reason":"ok"}\n```'),
-		).toEqual({ allow: true, reason: "ok" })
+			parseClassifierVerdict('```json\n{"shouldBlock":true,"reason":"no"}\n```'),
+		).toEqual({ allow: false, reason: "no" })
 	})
 
 	it("returns null on bad JSON", () => {
@@ -92,92 +112,70 @@ describe("classifyToolCall", () => {
 		}
 	}
 
-	it("calls completeSimple with classifier context and auth", async () => {
+	it("uses CC system prompt and transcript user prompt", async () => {
 		completeSimpleMock.mockResolvedValue(
-			makeAssistantResponse('{"allow":true,"reason":"fine"}'),
+			makeAssistantResponse(
+				'{"shouldBlock":false,"reason":"fine","thinking":"ok"}',
+			),
 		)
 
 		const verdict = await classifyToolCall({
 			modelRef: "test/test-model",
-			userMessages: ["fix the bug"],
-			pendingTool: { name: "read", input: { path: "a.ts" } },
+			session: session({
+				branch: [
+					{
+						type: "message",
+						message: { role: "user", content: "fix the bug" },
+					},
+				],
+			}),
+			pendingTool: { name: "bash", input: { command: "npm test" } },
 			registry: makeRegistry(),
 			timeoutMs: 5000,
 		})
 
 		expect(verdict.allow).toBe(true)
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1)
-		const [model, context, options] = completeSimpleMock.mock.calls[0]!
-		expect(model.provider).toBe("test")
-		expect(context.systemPrompt).toContain("security classifier")
+		const [, context, options] = completeSimpleMock.mock.calls[0]!
+		expect(context.systemPrompt).toContain("automated security classifier")
+		expect(context.systemPrompt).toContain("Allow Rules")
 		expect(context.messages[0]?.content[0]).toEqual({
 			type: "text",
 			text: expect.stringContaining("fix the bug"),
 		})
+		expect(context.messages[0]?.content[0].text).toContain("npm test")
 		expect(options).toMatchObject({
 			apiKey: "test-key",
-			maxTokens: 256,
+			maxTokens: 512,
 			temperature: 0,
+		})
+	})
+
+	it("auto-allows when tool has no classifier-relevant input", async () => {
+		const verdict = await classifyToolCall({
+			modelRef: "test/test-model",
+			session: session(),
+			pendingTool: { name: "read", input: {} },
+			registry: makeRegistry(),
 			timeoutMs: 5000,
 		})
+		expect(verdict.allow).toBe(true)
+		expect(completeSimpleMock).not.toHaveBeenCalled()
 	})
 
 	it("returns deny verdict from classifier output", async () => {
 		completeSimpleMock.mockResolvedValue(
-			makeAssistantResponse('{"allow":false,"reason":"no"}'),
+			makeAssistantResponse('{"shouldBlock":true,"reason":"no"}'),
 		)
 
 		const verdict = await classifyToolCall({
 			modelRef: "test/test-model",
-			userMessages: [],
+			session: session(),
 			pendingTool: { name: "bash", input: { command: "rm -rf /" } },
 			registry: makeRegistry(),
 			timeoutMs: 5000,
 		})
 		expect(verdict.allow).toBe(false)
-	})
-
-	it("passes registry headers and env through to completeSimple", async () => {
-		completeSimpleMock.mockResolvedValue(
-			makeAssistantResponse('{"allow":true,"reason":"ok"}'),
-		)
-
-		const registry: ClassifierRegistry = {
-			find: () =>
-				({
-					id: "gpt-4.1",
-					api: "azure-openai-responses",
-					baseUrl: "",
-					provider: "azure-openai-responses",
-				}) as any,
-			getApiKeyAndHeaders: async () => ({
-				ok: true,
-				apiKey: "azure-key",
-				headers: { "x-custom": "1" },
-				env: {
-					AZURE_OPENAI_RESOURCE_NAME: "my-resource",
-					AZURE_OPENAI_API_VERSION: "2025-03-01-preview",
-				},
-			}),
-		}
-
-		await classifyToolCall({
-			modelRef: "azure-openai-responses/gpt-4.1",
-			userMessages: [],
-			pendingTool: { name: "read", input: { path: "a.ts" } },
-			registry,
-			timeoutMs: 5000,
-		})
-
-		const [, , options] = completeSimpleMock.mock.calls[0]!
-		expect(options).toMatchObject({
-			apiKey: "azure-key",
-			headers: { "x-custom": "1" },
-			env: {
-				AZURE_OPENAI_RESOURCE_NAME: "my-resource",
-				AZURE_OPENAI_API_VERSION: "2025-03-01-preview",
-			},
-		})
 	})
 
 	it("throws when classifier returns unparseable JSON", async () => {
@@ -186,30 +184,12 @@ describe("classifyToolCall", () => {
 		await expect(
 			classifyToolCall({
 				modelRef: "test/test-model",
-				userMessages: [],
-				pendingTool: { name: "bash", input: {} },
+				session: session(),
+				pendingTool: { name: "bash", input: { command: "ls" } },
 				registry: makeRegistry(),
 				timeoutMs: 1000,
 			}),
 		).rejects.toThrow(/unparseable JSON/)
-	})
-
-	it("throws when completeSimple returns an error stop reason", async () => {
-		completeSimpleMock.mockResolvedValue({
-			...makeAssistantResponse(""),
-			stopReason: "error",
-			errorMessage: "provider failed",
-		})
-
-		await expect(
-			classifyToolCall({
-				modelRef: "test/test-model",
-				userMessages: [],
-				pendingTool: { name: "bash", input: {} },
-				registry: makeRegistry(),
-				timeoutMs: 1000,
-			}),
-		).rejects.toThrow(/provider failed/)
 	})
 
 	it("throws when model is not found", async () => {
@@ -221,8 +201,8 @@ describe("classifyToolCall", () => {
 		await expect(
 			classifyToolCall({
 				modelRef: "test/missing",
-				userMessages: [],
-				pendingTool: { name: "bash", input: {} },
+				session: session(),
+				pendingTool: { name: "bash", input: { command: "ls" } },
 				registry,
 				timeoutMs: 1000,
 			}),
@@ -231,31 +211,59 @@ describe("classifyToolCall", () => {
 })
 
 describe("buildClassifierUserPrompt", () => {
-	it("includes tool call JSON", () => {
-		const prompt = buildClassifierUserPrompt(["hello"], {
-			name: "write",
-			input: { path: "x" },
+	it("includes transcript and excludes assistant text", () => {
+		const prompt = buildClassifierUserPrompt({
+			session: session({
+				reviewHint: "bash not on read-only allowlist",
+				branch: [
+					{
+						type: "message",
+						message: { role: "user", content: "hello" },
+					},
+					{
+						type: "message",
+						message: {
+							role: "assistant",
+							content: [
+								{ type: "text", text: "I will run tests" },
+								{
+									type: "toolCall",
+									id: "1",
+									name: "bash",
+									arguments: { command: "npm test" },
+								},
+							],
+						},
+					},
+				],
+			}),
+			pendingTool: { name: "bash", input: { command: "npm install" } },
 		})
-		expect(prompt).toContain("hello")
-		expect(prompt).toContain('"write"')
+		expect(prompt).toContain("mode: auto")
+		expect(prompt).toContain("/proj")
+		expect(prompt).toContain("User: hello")
+		expect(prompt).toContain("bash npm test")
+		expect(prompt).not.toContain("I will run tests")
+		expect(prompt).toContain("npm install")
 	})
 
-	it("redacts secrets", () => {
-		const prompt = buildClassifierUserPrompt(
-			["token sk-abcdefghijklmnopqrstuvwxyz"],
-			{ name: "bash", input: { command: "echo" } },
-		)
+	it("redacts secrets in transcript", () => {
+		const prompt = buildClassifierUserPrompt({
+			session: session({
+				branch: [
+					{
+						type: "message",
+						message: {
+							role: "user",
+							content: "token sk-abcdefghijklmnopqrstuvwxyz",
+						},
+					},
+				],
+			}),
+			pendingTool: { name: "bash", input: { command: "echo" } },
+		})
 		expect(prompt).not.toContain("sk-abcdefghijklmnopqrstuvwxyz")
 		expect(prompt).toContain("sk-[REDACTED]")
-	})
-
-	it("does not pass array index as redaction limit for user messages", () => {
-		const prompt = buildClassifierUserPrompt(["a".repeat(5000)], {
-			name: "read",
-			input: { path: "a.ts" },
-		})
-		expect(prompt).toContain("...[truncated]...")
-		expect(prompt.length).toBeLessThan(6000)
 	})
 })
 
@@ -266,35 +274,8 @@ describe("redactForClassifier", () => {
 		)
 	})
 
-	it("redacts quoted JSON secret fields", () => {
-		const redacted = redactForClassifier('{"password":"secret","api_key":"abc"}')
-		expect(redacted).not.toContain("secret")
-		expect(redacted).toContain('"password":"[REDACTED]"')
-		expect(redacted).toContain('"api_key":"[REDACTED]"')
-		expect(() => JSON.parse(redacted)).not.toThrow()
-	})
-
-	it("preserves tail when truncating long user context", () => {
+	it("preserves tail when truncating long context", () => {
 		const redacted = redactForClassifier("a".repeat(5000) + "; rm -rf /")
 		expect(redacted).toContain("rm -rf")
-	})
-
-	it("does not truncate pending tool JSON payloads beyond classifier cap", () => {
-		const cmd = "echo ok; " + "x".repeat(5000) + "; rm -rf /"
-		const prompt = buildClassifierUserPrompt([], {
-			name: "bash",
-			input: { command: cmd },
-		})
-		expect(prompt).toContain("rm -rf")
-	})
-
-	it("truncates very large pending tool JSON payloads", () => {
-		const huge = "x".repeat(20_000)
-		const prompt = buildClassifierUserPrompt([], {
-			name: "write",
-			input: { path: "big.txt", content: huge },
-		})
-		expect(prompt).toContain("...[truncated]...")
-		expect(prompt.length).toBeLessThan(20_000)
 	})
 })

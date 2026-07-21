@@ -1,3 +1,21 @@
+## [2.1.0] - 2026-07-15
+
+### Added
+- **CC-style permission rules** (`permissions.ts`, `permissions-loader.ts`, `permission-rule-parser.ts`, `shell-rule-matching.ts`, `bash-permission-match.ts`, `path-permission-match.ts`): `allow` / `deny` / `ask` lists with `Tool(specifier)` syntax aligned to Claude Code.
+- **Three config scopes**: global (`~/.pi/agent/permission-modes.json`), project (`<cwd>/.pi/projects/<id>/permissions.json`), local (`permissions.local.json`).
+- **`/permissions`** command to list merged rules.
+- **Approval persistence**: "Allow always (this project)" and "Allow always (global)" on permission prompts.
+
+### Changed
+- **Tool gate**: configured rules run before mode gate (bypass exempt). `allow` skips mode prompts; `deny` always blocks; `ask` forces approval.
+- **Auto mode**: risky ops prompt with allow-always options (replacing hard-block-only for tier-3 in recent builds).
+
+### Notes
+- Total tests: **275 passing**.
+- Bash rule matching: deny/ask evaluate compound commands per segment; allow does not match compound commands (CC security model).
+
+[2.1.0]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.0.0...v2.1.0
+
 ## [2.0.0] - 2026-07-11
 
 ### Added
