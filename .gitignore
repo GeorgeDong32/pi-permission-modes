@@ -3,3 +3,4 @@ package-lock.json
 .pi/plan/
 .pi/reports/
 .pi/self-taught/
+.auto-test-marker
