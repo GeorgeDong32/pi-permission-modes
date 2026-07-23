@@ -109,6 +109,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   let planExecuting = false;
   let planPhase: PlanPhase = "exploring";
   let lastExtractedPlanHash = "";
+  let lastPlanOfferAt = 0;
+  const PLAN_OFFER_COOLDOWN_MS = 60_000;
   let needsAskReminder = false;
   let needsBypassSecurityReminder = false;
   let pendingComplianceInject = false;
@@ -799,6 +801,43 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       );
       const picked = MODE_CYCLE.find((m) => MODE_META[m].label === choice);
       if (picked) await setMode(picked, ctx);
+    },
+  });
+
+  pi.registerCommand("plan-execute", {
+    description:
+      "Execute the current plan immediately (switches to auto mode with step tracking)",
+    handler: async (_args, ctx) => {
+      if (currentMode !== "plan" && !planExecuting) {
+        ctx.ui.notify("Not in plan mode. Use /plan first.", "warning");
+        return;
+      }
+      const planContent = readPlanFile(ctx.cwd);
+      const extracted = filterSubstantivePlanItems(
+        planContent ? extractTodoItems(planContent) : [],
+      );
+      if (!extracted.length) {
+        ctx.ui.notify("No plan steps found in plan.md. Write a plan first.", "warning");
+        return;
+      }
+      planExecuting = true;
+      planPhase = "executing";
+      planTodos = extracted;
+      currentMode = "auto";
+      applyToolRestrictions();
+      updateStatus(ctx);
+      updatePlanWidget(ctx);
+      persistState();
+      await applyProfileModelForMode("auto", ctx);
+      const steps = planTodos.map((t) => `${t.step}. ${t.text}`).join("\n");
+      pi.sendMessage(
+        {
+          customType: "modes-execute",
+          content: `Execute the plan now. Steps:\n${steps}\n\nStart with step 1. After finishing each step, include a [DONE:n] tag in your reply.`,
+          display: true,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
     },
   });
 
@@ -1494,6 +1533,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
     if (!extracted.length) return;
 
+    // Cooldown: don't re-offer within 60s of the last offer.
+    if (Date.now() - lastPlanOfferAt < PLAN_OFFER_COOLDOWN_MS) return;
+
     const syncedContent = readPlanFile(ctx.cwd) ?? planContent ?? "";
     const contentHash = hashPlan(
       syncedContent || JSON.stringify(extracted),
@@ -1506,6 +1548,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     planTodos = extracted;
     persistState();
 
+    lastPlanOfferAt = Date.now();
     const choice = await ctx.ui.select("Plan ready — what next?", [
       "Execute the plan",
       "Stay in plan mode",

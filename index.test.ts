@@ -1350,7 +1350,7 @@ describe("skill filtering in before_agent_start", () => {
 		expect(result?.systemPrompt).toBeDefined()
 		expect(result!.systemPrompt).toContain("brainstorming")
 		expect(result!.systemPrompt).not.toContain("systematic-debugging")
-		expect(result!.systemPrompt).toContain("[Plan]")
+		expect(result!.systemPrompt).toContain("[Plan Mode]")
 		expect(result?.message).toBeUndefined()
 	})
 

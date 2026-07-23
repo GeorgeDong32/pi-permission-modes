@@ -920,12 +920,18 @@ export function resolveModePrompt(opts: ResolveModePromptOpts): string {
 	}
 
 	if (mode === "plan" && planFilePath) {
-		let block = `[Plan] Read-only mode. Maintain the numbered plan in:\n  ${planFilePath}\nUse \`read\` to review and \`edit\` to update the plan file. Do not change other files.`
+		let block = `[Plan Mode] You are in plan mode. In this mode:
+- Only use read-only tools (read, grep, find, ls, and read-only bash like git status/log/diff).
+- Explore the codebase, understand architecture, and design an implementation approach.
+- Do NOT edit, write, or run mutating commands. Do NOT implement anything yet.
+- Maintain your plan as a numbered list in: ${planFilePath}
+- Use \`read\` to review and \`edit\` to update ONLY the plan file.
+- When your plan is complete and concrete, tell the user it is ready for review.
+- The user will approve or refine the plan before execution begins.`;
 		if (planPhase === "executing") {
-			block +=
-				"\n[Plan/executing] Execute steps from plan.md. Mark progress with [DONE:n] tags."
+			block = `[Plan/executing] Execute steps from plan.md. Mark progress with [DONE:n] tags.`;
 		}
-		return block
+		return block;
 	}
 
 	if (mode === "bypass" && needsBypassSecurityReminder) {
