@@ -125,6 +125,7 @@ function createFakePi(): FakePi {
 		registerShortcut(key: string, def: { handler: Handler }) {
 			shortcuts.set(key, def.handler)
 		},
+		registerTool(_def: unknown) {},
 		registerFlag(name: string, def: { default?: unknown }) {
 			// Always record the flag so the extension can read it via getFlag.
 			// Default is honored when provided.

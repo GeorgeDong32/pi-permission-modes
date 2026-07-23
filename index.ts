@@ -10,11 +10,13 @@
  *   - bypass  Full auto-approve (old auto semantics); sparse security reminders.
  */
 
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import { Type } from "@earendil-works/pi-ai";
+import {
+  defineTool,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os";
 import path from "node:path";
@@ -98,7 +100,7 @@ const MODE_META: Record<Mode, { icon: string; label: string; role: string }> = {
 };
 
 // Tools available in plan mode (edit/write only for plan.md via tool_call gate).
-const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls", "edit", "write"];
+const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls", "edit", "write", "plan_ready"];
 const PLAN_DISABLED = new Set<string>();
 
 type Block = { block: true; reason: string } | undefined;
@@ -840,6 +842,113 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       );
     },
   });
+
+  // ---- plan_ready tool (model-initiated plan submission) -------------------
+  const PLAN_READY_TOOL_NAME = "plan_ready";
+
+  pi.registerTool(defineTool({
+    name: PLAN_READY_TOOL_NAME,
+    label: "Plan Ready",
+    description:
+      "Submit the completed plan to the user for approval. Only available in plan mode. The user will see the plan and choose to execute, refine, or stay in plan mode.",
+    promptSnippet:
+      "Call plan_ready when your plan in plan.md is complete and ready for user review.",
+    promptGuidelines: [
+      "Only call plan_ready when you have finished exploring and the plan file contains a concrete, numbered implementation plan.",
+      "Do NOT call plan_ready if the plan still has open questions or incomplete sections.",
+      "After calling plan_ready, stop and wait for the user's decision. Do not begin implementation.",
+      "If the user asks to refine, update plan.md and call plan_ready again when ready.",
+    ],
+    parameters: Type.Object({
+      summary: Type.Optional(
+        Type.String({ description: "Brief one-line summary of the plan for the approval dialog." }),
+      ),
+    }),
+    executionMode: "sequential",
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (currentMode !== "plan") {
+        return {
+          content: [{ type: "text", text: "plan_ready is only available in plan mode. Current mode: " + currentMode }],
+        };
+      }
+      const planContent = readPlanFile(ctx.cwd);
+      const extracted = filterSubstantivePlanItems(
+        planContent ? extractTodoItems(planContent) : [],
+      );
+      if (!extracted.length) {
+        return {
+          content: [{ type: "text", text: "No plan steps found in plan.md. Write a numbered plan first, then call plan_ready." }],
+        };
+      }
+
+      planTodos = extracted;
+      persistState();
+      updatePlanWidget(ctx);
+
+      const summaryLine = params.summary?.trim()
+        ? `${params.summary.trim()}\n\n`
+        : "";
+      const stepsPreview = extracted.map((t) => `${t.step}. ${t.text}`).join("\n");
+
+      if (!ctx.hasUI) {
+        // Headless: auto-execute
+        return {
+          content: [{ type: "text", text: `Plan submitted (headless auto-execute).\n${summaryLine}${stepsPreview}` }],
+        };
+      }
+
+      lastPlanOfferAt = Date.now();
+      const choice = await ctx.ui.select(
+        `${summaryLine}Plan ready (${extracted.length} steps) — what next?`,
+        ["Execute the plan", "Refine the plan", "Stay in plan mode"],
+      );
+
+      if (choice === "Execute the plan") {
+        planExecuting = true;
+        planPhase = "executing";
+        currentMode = "auto";
+        applyToolRestrictions();
+        updateStatus(ctx);
+        persistState();
+        await applyProfileModelForMode("auto", ctx);
+        const steps = planTodos.map((t) => `${t.step}. ${t.text}`).join("\n");
+        pi.sendMessage(
+          {
+            customType: "modes-execute",
+            content: `Execute the plan now. Steps:\n${steps}\n\nStart with step 1. After finishing each step, include a [DONE:n] tag in your reply.`,
+            display: true,
+          },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+        return {
+          content: [{ type: "text", text: "Plan approved by user. Switching to execution mode." }],
+          terminate: true,
+        };
+      }
+
+      if (choice === "Refine the plan") {
+        planPhase = "refining";
+        return {
+          content: [{ type: "text", text: "User wants to refine the plan. Ask what they'd like changed, update plan.md, then call plan_ready again when ready." }],
+        };
+      }
+
+      // Stay in plan mode
+      return {
+        content: [{ type: "text", text: "User chose to stay in plan mode. Continue refining the plan or wait for further instructions." }],
+      };
+    },
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", "plan_ready ") + theme.fg("muted", truncateToWidth(String(args?.summary ?? ""), 60)),
+        0, 0,
+      );
+    },
+    renderResult(result, _options, theme) {
+      const first = result.content?.find((c: any) => c.type === "text");
+      return new Text(theme.fg("muted", truncateToWidth(String(first?.text ?? ""), 80)), 0, 0);
+    },
+  }));
 
   // ---- /model-profile command -------------------------------------------
   // Show, list, or activate a model profile from `~/.pi/agent/model-profiles.json`.
