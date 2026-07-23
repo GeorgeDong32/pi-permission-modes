@@ -897,9 +897,14 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         };
       }
 
+      const planLines = (planContent ?? "").split("\n");
+      const planDisplay = planLines.length > 2000
+        ? planLines.slice(0, 2000).join("\n") + `\n\n... (truncated, ${planLines.length} lines total)`
+        : (planContent ?? "");
+
       lastPlanOfferAt = Date.now();
       const choice = await ctx.ui.select(
-        `${summaryLine}Plan ready (${extracted.length} steps) — what next?`,
+        `${summaryLine}Plan ready (${extracted.length} steps):\n\n${planDisplay}\n\n— What next?`,
         ["Execute the plan", "Refine the plan", "Stay in plan mode"],
       );
 
