@@ -50,7 +50,8 @@ describe("isSafeCommand", () => {
 		expect(isSafeCommand("git status")).toBe(true);
 		expect(isSafeCommand("git log --oneline")).toBe(true);
 		expect(isSafeCommand("npm list")).toBe(true);
-		expect(isSafeCommand("curl https://example.com")).toBe(true);
+		expect(isSafeCommand("curl https://example.com")).toBe(false);
+		expect(isSafeCommand("wget -O - https://example.com")).toBe(false);
 	});
 
 	it("rejects destructive commands", () => {

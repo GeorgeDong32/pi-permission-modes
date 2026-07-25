@@ -50,7 +50,8 @@ const CC_TOOL_OUTPUT_LINE =
 
 const PI_JSON_OUTPUT = `## Output Format
 
-Reply with JSON only: {"thinking": string, "shouldBlock": boolean, "reason": string}
+Reply with a single JSON object only — no markdown fences, no prose before or after.
+Required shape: {"thinking": string, "shouldBlock": boolean, "reason": string}
 - shouldBlock=false → ALLOW (auto-approve the pending tool call)
 - shouldBlock=true → BLOCK (require explicit user confirmation)
 Keep thinking brief. Keep reason under one sentence.`

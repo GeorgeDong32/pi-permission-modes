@@ -9,12 +9,28 @@ import { join } from "node:path"
 
 import type { AutoModeRules } from "./classifier-prompt.ts"
 
+export type ClassifierStage = "tool" | "single" | "fast" | "both" | "thinking"
+
+export const CLASSIFIER_STAGE_SUFFIXES: readonly ClassifierStage[] = [
+	"tool",
+	"single",
+	"fast",
+	"both",
+	"thinking",
+] as const
+
 export interface ClassifierConfig {
 	enabled: boolean
 	model: string
 	timeoutMs: number
 	/** CC-style JSONL transcript lines instead of "User:" / "bash cmd" format. */
 	jsonlTranscript?: boolean
+	/** When true (default), classifier errors deny the action instead of local fallback. */
+	failClosed?: boolean
+	/** Classifier pipeline — see docs/prompts/auto-mode-prompts.md. Default `tool`. */
+	stage?: ClassifierStage
+	/** Inject AGENTS.md / CLAUDE.md into classifier context. */
+	includeAgentsMd?: boolean
 }
 
 export interface PermissionModesConfig {
@@ -41,7 +57,10 @@ export function setConfigPath(p: string): void {
 const DEFAULT_CLASSIFIER: ClassifierConfig = {
 	enabled: true,
 	model: "anthropic/claude-haiku-4-5",
-	timeoutMs: 5000,
+	timeoutMs: 15000,
+	failClosed: true,
+	stage: "tool",
+	includeAgentsMd: true,
 }
 
 export function resolveClassifierConfig(
@@ -53,6 +72,9 @@ export function resolveClassifierConfig(
 		model: c.model ?? DEFAULT_CLASSIFIER.model,
 		timeoutMs: c.timeoutMs ?? DEFAULT_CLASSIFIER.timeoutMs,
 		jsonlTranscript: c.jsonlTranscript ?? false,
+		failClosed: c.failClosed ?? DEFAULT_CLASSIFIER.failClosed,
+		stage: c.stage ?? DEFAULT_CLASSIFIER.stage,
+		includeAgentsMd: c.includeAgentsMd ?? DEFAULT_CLASSIFIER.includeAgentsMd,
 	}
 }
 

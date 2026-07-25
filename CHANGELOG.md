@@ -1,3 +1,46 @@
+## [2.4.0] - 2026-07-25
+
+### Added
+- **CC-aligned auto security stack**: deny-and-continue on classifier blocks, fail-closed (`classifier.failClosed`, default `true`) when classifier is unavailable, denial tracking (3 consecutive / 20 total → manual UI).
+- **Classifier pipelines** (`classifier.stage`: `tool` | `single` | `fast` | `both` | `thinking`, default `tool`). `tool` uses CC-style forced `classify_result` tool call with API thinking disabled; XML stages use fast-screen + optional CoT escalation in `classifier-client.ts`.
+- **`classifier-tool.ts`**: `classify_result` tool schema aligned with Claude Code auto-mode classifier.
+- **Model ref stage suffix**: `provider/model@tool` (or `@single`, `@fast`, `@both`, `@thinking`) overrides `classifier.stage` for per-model pipeline selection.
+- **`dangerous-permissions.ts`**: strips broad/dangerous `allow` rules (e.g. `Bash(*)`, `Bash(python:*)`) on auto mode entry; restores on exit.
+- **`classifier-messages.ts`**, **`denial-tracking.ts`**, **`injection-probe.ts`**: CC-style rejection messages, denial counters, and tool-output injection warnings.
+- **`classifier.includeAgentsMd`** config (default `true`); agents config cannot override deny rules in classifier prompt.
+- **`parseModelRef`** supports `:thinking` / `:high` profile suffixes.
+
+### Changed
+- **Breaking: tighter auto tiers** — `curl`/`wget` removed from tier-1; `npm install`, `git fetch/pull`, arbitrary `node`/`python`, `docker pull` removed from tier-2. These now require classifier (tier-3) or manual approval.
+- **Classifier block** no longer opens approval UI by default; returns structured deny-and-continue message to the agent.
+- **Classifier failure** no longer fail-opens to local rules when `failClosed` is true (default).
+
+### Migration
+1. Expect more tier-3 reviews for network and package-install commands in auto mode.
+2. Broad `Bash(*)` / interpreter allow rules are ignored while in auto mode (restored when leaving auto).
+3. Ensure classifier model is configured and `timeoutMs` ≥ 20000 for remote providers.
+4. Default classifier pipeline is `tool` (forced `classify_result`). Use `classifier.stage: "single"` for free-form JSON, or `@both` / `stage: "both"` for CC XML two-stage. Append `@tool` on `classifier.model` to force tool mode for one model without changing global config.
+
+[2.4.0]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.3.0...v2.4.0
+
+## [2.3.0] - 2026-07-25
+
+### Added
+- **`plan_ready` tool** for model-initiated plan submission in plan mode.
+- **Full plan display** in the plan approval dialog.
+
+### Changed
+- Plan mode: cooldown, richer prompt, and `/plan-execute` improvements.
+
+[2.3.0]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.2.0...v2.3.0
+
+## [2.2.0] - 2026-07-25
+
+### Added
+- **Auto mode 4-tier gate** with broader auto-approve patterns and classifier hardening.
+
+[2.2.0]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.1.0...v2.2.0
+
 ## [2.1.0] - 2026-07-15
 
 ### Added

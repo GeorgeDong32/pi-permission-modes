@@ -26,10 +26,30 @@ import {
   type ClassifierSessionContext,
 } from "./classifier-client.ts";
 import {
+  buildClassifierUnavailableMessage,
+  buildYoloRejectionMessage,
+} from "./classifier-messages.ts";
+import {
   loadPermissionModesConfig,
   resolveAutoModeConfig,
   resolveClassifierConfig,
 } from "./config.ts";
+import {
+  restoreDangerousPermissionRules,
+  stripDangerousPermissionRules,
+} from "./dangerous-permissions.ts";
+import {
+  createDenialTrackingState,
+  recordClassifierDenial,
+  recordClassifierSuccess,
+  shouldFallbackToPrompting,
+  type DenialTrackingState,
+} from "./denial-tracking.ts";
+import {
+  buildInjectionWarningBlock,
+  scanBranchForInjectionSignals,
+  TOOL_OUTPUT_INJECTION_WARNING,
+} from "./injection-probe.ts";
 import {
   addPermissionRule,
   loadMergedPermissionRules,
@@ -76,6 +96,9 @@ import {
   type TodoItem,
 } from "./utils.ts";
 import {
+  runPlanApprovalDialog,
+} from "./plan-approval-dialog.ts";
+import {
   ensureModelProfilesConfig,
   getActiveProfileName,
   listProfiles,
@@ -101,6 +124,7 @@ const MODE_META: Record<Mode, { icon: string; label: string; role: string }> = {
 
 // Tools available in plan mode (edit/write only for plan.md via tool_call gate).
 const PLAN_TOOLS = ["read", "bash", "grep", "find", "ls", "edit", "write", "plan_ready"];
+const PLAN_READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const PLAN_DISABLED = new Set<string>();
 
 type Block = { block: true; reason: string } | undefined;
@@ -122,12 +146,26 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   let projectRoot: string | null = null;
   let classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
   let autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
+  let basePermissionRules: PermissionRule[] = [];
+  let strippedDangerousRules: PermissionRule[] = [];
   let mergedPermissionRules: PermissionRule[] = [];
-  let classifierConsecutiveFailures = 0;
+  let classifierDenialState: DenialTrackingState = createDenialTrackingState();
   const MAX_CLASSIFIER_FAILURES = 3;
 
+  function applyAutoModePermissionStrip(): void {
+    if (currentMode === "auto") {
+      const stripped = stripDangerousPermissionRules(basePermissionRules);
+      strippedDangerousRules = stripped.stashed;
+      mergedPermissionRules = stripped.active;
+    } else {
+      strippedDangerousRules = [];
+      mergedPermissionRules = basePermissionRules;
+    }
+  }
+
   function reloadMergedPermissionRules(cwd: string): void {
-    mergedPermissionRules = loadMergedPermissionRules(cwd);
+    basePermissionRules = loadMergedPermissionRules(cwd);
+    applyAutoModePermissionStrip();
   }
 
   // ---- model-profile state -----------------------------------------------
@@ -250,6 +288,80 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     return promptWithPermissionOptions(ctx, tool, input, reason, category);
   }
 
+  function classifierErrorMessage(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+  }
+
+  function logClassifierUnavailable(err: unknown, attempt: number): void {
+    const debug = process.env.PERMISSION_MODES_CLASSIFIER_DEBUG === "1";
+    const message = classifierErrorMessage(err);
+    const line = `[permission-modes] Classifier unavailable (${attempt}/${MAX_CLASSIFIER_FAILURES}): ${message}`;
+    if (debug) {
+      console.warn(line);
+      if (err instanceof Error && err.stack) console.debug(err.stack);
+      return;
+    }
+    if (attempt >= MAX_CLASSIFIER_FAILURES) {
+      console.warn(line);
+    }
+  }
+
+  type LocalAutoTier3Decision =
+    | { allow: true }
+    | { allow: false; reason: string; category: string };
+
+  function resolveLocalAutoTier3(
+    tool: string,
+    input: Record<string, unknown>,
+    riskInput: {
+      tool: string;
+      command?: string;
+      path?: string;
+    },
+    cwd: string,
+  ): LocalAutoTier3Decision {
+    const risk = checkAutoRisk(riskInput, cwd);
+    if (risk.match) {
+      return { allow: false, reason: risk.reason, category: risk.category };
+    }
+
+    const isKnownTier3 =
+      tool === "bash" || tool === "edit" || tool === "write";
+    if (!isKnownTier3) {
+      return {
+        allow: false,
+        reason: `Tool "${tool}" is not auto-approved in auto mode. Enable classifier or switch to bypass.`,
+        category: "unknown-tool",
+      };
+    }
+    if (tool === "bash") {
+      const cmd = String(input.command ?? "");
+      if (cmd && !isAutoFallbackBash(cmd)) {
+        return {
+          allow: false,
+          reason: `Mutating bash in auto mode: ${cmd}`,
+          category: "mutating-bash",
+        };
+      }
+    }
+    return { allow: true };
+  }
+
+  function finishAutoTier3Allow(
+    ctx: ExtensionContext,
+    tool: string,
+    input: Record<string, unknown>,
+  ): undefined {
+    if (tool === "edit" || tool === "write") {
+      trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+    }
+    return undefined;
+  }
+
+  function classifierDenyBlock(tool: string, reason: string): Block {
+    return { block: true, reason: buildYoloRejectionMessage(reason) };
+  }
+
   async function approveAutoTier3(
     ctx: ExtensionContext,
     tool: string,
@@ -260,88 +372,69 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       path?: string;
     },
   ): Promise<Block> {
-    let classifierAllowed = false;
     const reviewHint = describeTier3Review(tool, input, ctx.cwd);
+
     if (classifierConfig.enabled) {
-      try {
-        const verdict = await classifyToolCall({
-          modelRef: classifierConfig.model,
-          session: collectClassifierSessionContext(ctx, reviewHint),
-          pendingTool: { name: tool, input },
-          registry: ctx.modelRegistry as any,
-          autoMode: autoModeConfig,
-          timeoutMs: classifierConfig.timeoutMs,
-          jsonlTranscript: classifierConfig.jsonlTranscript,
-          signal: ctx.signal,
-          debug: process.env.PERMISSION_MODES_CLASSIFIER_DEBUG === "1",
-        });
-        if (!verdict.allow) {
-          return promptAutoTier3(
-            ctx,
-            tool,
-            input,
-            verdict.reason || "Blocked by auto classifier",
-            "classifier",
-          );
-        }
-        classifierAllowed = true;
-        classifierConsecutiveFailures = 0;
-      } catch (err) {
-        classifierConsecutiveFailures++;
-        console.warn(
-          `[permission-modes] Classifier unavailable (${classifierConsecutiveFailures}/${MAX_CLASSIFIER_FAILURES}):`,
-          err,
-        );
-        // Fallback: check local auto-approvable rules before prompting.
-        const fallbackCmd = tool === "bash" ? String(input.command ?? "") : "";
-        if (fallbackCmd && isAutoApprovableBash(fallbackCmd)) {
-          return undefined;
-        }
-        return promptAutoTier3(
-          ctx,
-          tool,
-          input,
-          `Classifier unavailable: ${err instanceof Error ? err.message : String(err)}`,
-          "classifier-unavailable",
-        );
-      }
-    }
-
-    if (!classifierAllowed) {
-      const risk = checkAutoRisk(riskInput, ctx.cwd);
-      if (risk.match) {
-        return promptAutoTier3(ctx, tool, input, risk.reason, risk.category);
-      }
-
-      const isKnownTier3 =
-        tool === "bash" || tool === "edit" || tool === "write";
-      if (!isKnownTier3) {
-        return promptAutoTier3(
-          ctx,
-          tool,
-          input,
-          `Tool "${tool}" is not auto-approved in auto mode. Enable classifier or switch to bypass.`,
-          "unknown-tool",
-        );
-      }
-      if (tool === "bash") {
-        const cmd = String(input.command ?? "");
-        if (cmd && !isAutoFallbackBash(cmd)) {
-          return promptAutoTier3(
-            ctx,
-            tool,
-            input,
-            `Mutating bash in auto mode: ${cmd}`,
-            "mutating-bash",
-          );
+      for (let attempt = 1; attempt <= MAX_CLASSIFIER_FAILURES; attempt++) {
+        try {
+          const verdict = await classifyToolCall({
+            modelRef: classifierConfig.model,
+            session: collectClassifierSessionContext(ctx, reviewHint),
+            pendingTool: { name: tool, input },
+            registry: ctx.modelRegistry as any,
+            autoMode: autoModeConfig,
+            timeoutMs: classifierConfig.timeoutMs,
+            jsonlTranscript: classifierConfig.jsonlTranscript,
+            stage: classifierConfig.stage,
+            includeAgentsMd: classifierConfig.includeAgentsMd,
+            signal: ctx.signal,
+            debug: process.env.PERMISSION_MODES_CLASSIFIER_DEBUG === "1",
+          });
+          if (!verdict.allow) {
+            classifierDenialState = recordClassifierDenial(classifierDenialState);
+            if (shouldFallbackToPrompting(classifierDenialState)) {
+              return promptAutoTier3(
+                ctx,
+                tool,
+                input,
+                verdict.reason || "Blocked by auto classifier (denial limit)",
+                "classifier-limit",
+              );
+            }
+            return classifierDenyBlock(
+              tool,
+              verdict.reason || "Blocked by auto classifier",
+            );
+          }
+          classifierDenialState = recordClassifierSuccess(classifierDenialState);
+          return finishAutoTier3Allow(ctx, tool, input);
+        } catch (err) {
+          if (attempt < MAX_CLASSIFIER_FAILURES) {
+            if (process.env.PERMISSION_MODES_CLASSIFIER_DEBUG === "1") {
+              console.debug(
+                `[permission-modes] Classifier retry (${attempt}/${MAX_CLASSIFIER_FAILURES}): ${classifierErrorMessage(err)}`,
+              );
+            }
+            continue;
+          }
+          logClassifierUnavailable(err, attempt);
+          if (classifierConfig.failClosed !== false) {
+            return classifierDenyBlock(
+              tool,
+              buildClassifierUnavailableMessage(tool, classifierConfig.model),
+            );
+          }
+          break;
         }
       }
     }
 
-    if (tool === "edit" || tool === "write") {
-      trackOutsideWriteIfNeeded(ctx, tool, String(input.path ?? ""));
+    const local = resolveLocalAutoTier3(tool, input, riskInput, ctx.cwd);
+    if (!local.allow) {
+      return promptAutoTier3(ctx, tool, input, local.reason, local.category);
     }
-    return undefined;
+    classifierDenialState = recordClassifierSuccess(classifierDenialState);
+    return finishAutoTier3Allow(ctx, tool, input);
   }
 
   function trackOutsideWriteIfNeeded(
@@ -403,12 +496,15 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     } catch {
       // classifier still runs with pending action only
     }
+    const includeAgentsMd = classifierConfig.includeAgentsMd !== false;
     return {
       cwd: ctx.cwd,
       mode: currentMode,
       branch,
       reviewHint,
-      agentsMd: readAgentsMdForClassifier(ctx.cwd),
+      agentsMd: includeAgentsMd
+        ? readAgentsMdForClassifier(ctx.cwd)
+        : null,
     };
   }
 
@@ -435,12 +531,28 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   // ---- mode switching ----------------------------------------------------
   async function setMode(mode: Mode, ctx: ExtensionContext): Promise<void> {
     const prev = currentMode;
+
+    if (prev === "auto" && mode !== "auto" && strippedDangerousRules.length) {
+      basePermissionRules = restoreDangerousPermissionRules(
+        mergedPermissionRules,
+        strippedDangerousRules,
+      );
+      strippedDangerousRules = [];
+    }
+
     currentMode = mode;
     needsAskReminder = mode === "ask";
     needsBypassSecurityReminder = mode === "bypass";
     pendingComplianceInject = false;
     complianceCategory = "";
     planExecuting = false;
+
+    if (mode === "auto") {
+      classifierDenialState = createDenialTrackingState();
+      applyAutoModePermissionStrip();
+    } else if (prev === "auto") {
+      applyAutoModePermissionStrip();
+    }
 
     if (mode !== "plan") {
       planPhase = "exploring";
@@ -843,6 +955,28 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     },
   });
 
+  // ---- plan approval helpers ---------------------------------------------
+  async function promptPlanRefinement(ctx: ExtensionContext): Promise<void> {
+    if (!ctx.hasUI) return;
+    planPhase = "refining";
+    const refinement = await ctx.ui.editor("Refine the plan:", "");
+    if (refinement?.trim()) {
+      pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
+    }
+  }
+
+  function planReviewClosedToolResult() {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: "Plan review closed. Wait for the user's next message; do not continue on your own.",
+        },
+      ],
+      terminate: true as const,
+    };
+  }
+
   // ---- plan_ready tool (model-initiated plan submission) -------------------
   const PLAN_READY_TOOL_NAME = "plan_ready";
 
@@ -885,30 +1019,25 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       persistState();
       updatePlanWidget(ctx);
 
-      const summaryLine = params.summary?.trim()
-        ? `${params.summary.trim()}\n\n`
-        : "";
+      const summary = params.summary?.trim() || undefined;
       const stepsPreview = extracted.map((t) => `${t.step}. ${t.text}`).join("\n");
 
       if (!ctx.hasUI) {
         // Headless: auto-execute
+        const summaryLine = summary ? `${summary}\n\n` : "";
         return {
           content: [{ type: "text", text: `Plan submitted (headless auto-execute).\n${summaryLine}${stepsPreview}` }],
         };
       }
 
-      const planLines = (planContent ?? "").split("\n");
-      const planDisplay = planLines.length > 2000
-        ? planLines.slice(0, 2000).join("\n") + `\n\n... (truncated, ${planLines.length} lines total)`
-        : (planContent ?? "");
-
       lastPlanOfferAt = Date.now();
-      const choice = await ctx.ui.select(
-        `${summaryLine}Plan ready (${extracted.length} steps):\n\n${planDisplay}\n\n— What next?`,
-        ["Execute the plan", "Refine the plan", "Stay in plan mode"],
-      );
+      const choice = await runPlanApprovalDialog(ctx, {
+        summary,
+        planContent: planContent ?? "",
+        stepCount: extracted.length,
+      });
 
-      if (choice === "Execute the plan") {
+      if (choice === "execute") {
         planExecuting = true;
         planPhase = "executing";
         currentMode = "auto";
@@ -931,17 +1060,13 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         };
       }
 
-      if (choice === "Refine the plan") {
-        planPhase = "refining";
-        return {
-          content: [{ type: "text", text: "User wants to refine the plan. Ask what they'd like changed, update plan.md, then call plan_ready again when ready." }],
-        };
+      if (choice === "refine") {
+        await promptPlanRefinement(ctx);
+        return planReviewClosedToolResult();
       }
 
-      // Stay in plan mode
-      return {
-        content: [{ type: "text", text: "User chose to stay in plan mode. Continue refining the plan or wait for further instructions." }],
-      };
+      // stay | cancel (Esc): close dialog and return to the input prompt.
+      return planReviewClosedToolResult();
     },
     renderCall(args, theme) {
       return new Text(
@@ -1274,6 +1399,13 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     return trimmed.includes(p);
   }
 
+  function allowToolCall(): undefined {
+    if (currentMode === "auto") {
+      classifierDenialState = recordClassifierSuccess(classifierDenialState);
+    }
+    return undefined;
+  }
+
   // ---- tool_call gate ----------------------------------------------------
   pi.on("tool_call", async (event, ctx): Promise<Block> => {
     const tool = event.toolName;
@@ -1289,14 +1421,30 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     }
 
     const permResult = await applyConfiguredPermissionRules(ctx, tool, input);
-    if (permResult === "allow") return undefined;
-    if (permResult !== "passthrough") return permResult;
+    if (permResult === "allow") return allowToolCall();
+    if (permResult !== "passthrough") {
+      // Plan exploration: allow read-only tools even when permission rules
+      // would ask, but still honor explicit deny rules.
+      if (
+        currentMode === "plan" &&
+        PLAN_READ_TOOLS.has(tool) &&
+        !String((permResult as { reason?: string }).reason ?? "").startsWith(
+          "Denied by permission rule",
+        )
+      ) {
+        return undefined;
+      }
+      return permResult;
+    }
 
     // PLAN EXECUTION: use auto-mode tiered gate (classifier + blacklist).
     // planExecuting only affects prompt injection and UI; it does not bypass auto.
 
     // PLAN: read-only except plan.md; bash allowlist only.
     if (currentMode === "plan") {
+      if (PLAN_READ_TOOLS.has(tool)) {
+        return undefined;
+      }
       if (tool === "edit" || tool === "write") {
         const pathStr = String(input.path ?? "");
         if (pathStr && isPlanFilePath(pathStr, ctx.cwd)) {
@@ -1332,7 +1480,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
             "sensitive-path",
           );
         }
-        return undefined;
+        return allowToolCall();
       }
 
       if (tool === "edit" || tool === "write") {
@@ -1347,7 +1495,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
           );
         }
         if (!pathStr || !isOutsideCwd(pathStr, ctx.cwd)) {
-          return undefined;
+          return allowToolCall();
         }
       }
 
@@ -1364,7 +1512,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         }
         // Tier 1: read-only bash auto-approves.
         if (cmd && isSafeCommand(cmd)) {
-          return undefined;
+          return allowToolCall();
         }
         // Tier 1.5: autoMode.allow user rules short-circuit before classifier.
         // Guard: compound commands (&&, ||, ;) must have ALL segments safe,
@@ -1372,7 +1520,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         if (cmd && autoModeConfig?.allow?.length) {
           if (autoModeConfig.allow.some((p) => matchAutoModePattern(cmd, p))) {
             if (isAutoApprovableBash(cmd)) {
-              return undefined;
+              return allowToolCall();
             }
             // Pattern matched but command has dangerous segments → fall through
           }
@@ -1385,7 +1533,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         }
         // Tier 2: common dev workflow commands auto-approve without classifier.
         if (cmd && isAutoApprovableBash(cmd)) {
-          return undefined;
+          return allowToolCall();
         }
       }
 
@@ -1470,6 +1618,10 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
   // ---- context injection (system prompt anchor) --------------------------
   pi.on("before_agent_start", async (event, ctx) => {
+    // Re-apply each turn so other extensions (e.g. hypa replace mode) cannot
+    // permanently drop plan-mode tools like ls/grep/find from the active set.
+    applyToolRestrictions();
+
     classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
     autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
     reloadMergedPermissionRules(ctx.cwd);
@@ -1515,6 +1667,23 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     if (needsAskReminder) needsAskReminder = false;
     if (needsBypassSecurityReminder) needsBypassSecurityReminder = false;
 
+    let injectionBlock = "";
+    if (currentMode === "auto" || currentMode === "bypass") {
+      injectionBlock = TOOL_OUTPUT_INJECTION_WARNING;
+      try {
+        const branch =
+          (ctx.sessionManager as any).getBranch?.() ??
+          (ctx as any).messages ??
+          [];
+        const signal = scanBranchForInjectionSignals(branch);
+        if (signal) {
+          injectionBlock = buildInjectionWarningBlock(signal);
+        }
+      } catch {
+        // best-effort scan only
+      }
+    }
+
     const skillFilter = resolveSkillFilter(modelProfileConfig, currentMode);
     let workingPrompt = systemPromptBase;
     if (skillFilter.length !== 1 || skillFilter[0] !== "*") {
@@ -1535,8 +1704,14 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     }
 
     const anchored = injectModePrompt(workingPrompt, modeBlock);
-    if (anchored !== workingPrompt || modeBlock) {
-      return { systemPrompt: anchored };
+    const withInjection =
+      injectionBlock && anchored
+        ? `${anchored}\n\n${injectionBlock}`
+        : injectionBlock && !anchored
+          ? injectionBlock
+          : anchored;
+    if (withInjection !== workingPrompt || modeBlock || injectionBlock) {
+      return { systemPrompt: withInjection || workingPrompt };
     }
     return undefined;
   });
@@ -1663,13 +1838,12 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     persistState();
 
     lastPlanOfferAt = Date.now();
-    const choice = await ctx.ui.select("Plan ready — what next?", [
-      "Execute the plan",
-      "Stay in plan mode",
-      "Refine the plan",
-    ]);
+    const choice = await runPlanApprovalDialog(ctx, {
+      planContent: syncedContent,
+      stepCount: extracted.length,
+    });
 
-    if (choice === "Execute the plan") {
+    if (choice === "execute") {
       planExecuting = true;
       planPhase = "executing";
       currentMode = "auto";
@@ -1687,15 +1861,10 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         },
         { triggerTurn: true, deliverAs: "followUp" },
       );
-    } else if (choice === "Refine the plan") {
-      planPhase = "refining";
-      const refinement = await ctx.ui.editor("Refine the plan:", "");
-      if (refinement && refinement.trim()) {
-        pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
-      }
-    } else {
-      planPhase = "refining";
+    } else if (choice === "refine") {
+      await promptPlanRefinement(ctx);
     }
+    // stay | cancel (Esc): dialog already closed; return silently to the input prompt.
   });
 
   pi.on("session_compact", async (_event, ctx) => {
@@ -1714,9 +1883,6 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     // and writes a default file with the user's default model detected from
     // settings.json). Re-runs on /reload so a user-deleted file is recreated.
     modelProfileConfig = ensureModelProfilesConfig();
-    classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
-    autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
-    reloadMergedPermissionRules(ctx.cwd);
 
     const flag = pi.getFlag("permission-mode");
     if (typeof flag === "string") {
@@ -1768,6 +1934,13 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     } catch {
       /* ignore */
     }
+
+    classifierConfig = resolveClassifierConfig(loadPermissionModesConfig());
+    autoModeConfig = resolveAutoModeConfig(loadPermissionModesConfig());
+    if (currentMode === "auto") {
+      classifierDenialState = createDenialTrackingState();
+    }
+    reloadMergedPermissionRules(ctx.cwd);
 
     try {
       gitBranch = (ctx.sessionManager as any).getGitBranch?.() ?? "";

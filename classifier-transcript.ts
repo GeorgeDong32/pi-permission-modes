@@ -145,10 +145,18 @@ export function formatActionForClassifier(
 export function buildTranscriptForClassifier(
 	branch: PiMessageEntry[],
 	jsonl = false,
+	maxEntries = 40,
+	maxChars = 12_000,
 ): string {
-	return buildTranscriptEntriesFromBranch(branch)
-		.map((e) => toCompact(e, jsonl))
-		.join("")
+	const entries = buildTranscriptEntriesFromBranch(branch)
+	let slice =
+		entries.length > maxEntries ? entries.slice(-maxEntries) : entries
+	let text = slice.map((e) => toCompact(e, jsonl)).join("")
+	while (slice.length > 1 && text.length > maxChars) {
+		slice = slice.slice(1)
+		text = slice.map((e) => toCompact(e, jsonl)).join("")
+	}
+	return text
 }
 
 export function compactTranscriptEntry(

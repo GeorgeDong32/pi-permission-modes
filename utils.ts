@@ -102,8 +102,6 @@ const SAFE_PATTERNS: RegExp[] = [
 	/^\s*node\s+--version/i,
 	/^\s*node\s+-v\b/i,
 	/^\s*python\s+--version/i,
-	/^\s*curl\s/i,
-	/^\s*wget\s+-O\s*-/i,
 	/^\s*jq\b/,
 	/^\s*sed\s+-n/i,
 	/^\s*awk\b/,
@@ -315,26 +313,25 @@ export function isAutoFallbackBash(command: string): boolean {
 // classifier review in auto mode.
 // ---------------------------------------------------------------------------
 
+// Tier-2 auto approvals (CC-aligned): routine builds/tests and cwd-local git ops.
+// Network fetch, package install, arbitrary interpreters, and git fetch/pull
+// require tier-3 classifier review.
 const AUTO_APPROVABLE_PATTERNS: RegExp[] = [
-	// Package management (install/update dependencies)
-	/^\s*npm\s+(install|ci|update|link|dedupe|rebuild)\b/i,
-	/^\s*(pnpm|yarn|bun)\s+(install|add|update|link|dedupe|rebuild)\b/i,
-	// Build / run scripts
+	// Build / run scripts (named scripts still reviewed by AUTO_FALLBACK for deploy-like names)
 	/^\s*npm\s+run\s+\S+/i,
 	/^\s*(pnpm|yarn|bun)\s+run\s+\S+/i,
 	/^\s*(make|cmake)\b/i,
 	/^\s*cargo\s+(build|check|clippy|fmt|test)\b/i,
-	/^\s*go\s+(build|vet|fmt|mod|test|run)\b/i,
-	// Git local write operations (no push/force)
+	/^\s*go\s+(build|vet|fmt|mod|test)\b/i,
+	// Git local write operations (no push/force/fetch/pull)
 	/^\s*git\s+(add|commit|stash|branch|checkout|switch|tag|init|clone)\b/i,
 	/^\s*git\s+(merge|rebase|cherry-pick|revert|reset|restore)\b/i,
-	/^\s*git\s+(fetch|pull)\b/i,
-	// File operations
+	// File operations within workflow
 	/^\s*mkdir\b/i,
 	/^\s*touch\b/i,
 	/^\s*cp\b/i,
 	/^\s*mv\b/i,
-	// Code formatting / linting / type-checking
+	// Code formatting / linting / type-checking (pinned tools only)
 	/^\s*npx\s+(prettier|eslint|tsc|esbuild|vite|next|nuxt|astro)\b/i,
 	/^\s*(prettier|eslint|biome)\b/i,
 	/^\s*tsc\b/i,
@@ -345,10 +342,8 @@ const AUTO_APPROVABLE_PATTERNS: RegExp[] = [
 	/^\s*pytest\b/i,
 	/^\s*go\s+test\b/i,
 	/^\s*cargo\s+test\b/i,
-	// Misc safe dev tools
-	/^\s*node\s+\S+/i,
-	/^\s*python3?\s+\S+/i,
-	/^\s*docker\s+(build|compose|run|exec|logs|ps|images|pull)\b/i,
+	// Docker local dev (no pull)
+	/^\s*docker\s+(build|compose|run|exec|logs|ps|images)\b/i,
 ];
 
 const AUTO_APPROVABLE_EXCLUDE: RegExp[] = [

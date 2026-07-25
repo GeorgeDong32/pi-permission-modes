@@ -1,7 +1,6 @@
 # Auto Mode — Prompt Reference
 
-> **Part of the v2.0.0 implementation.** Full autonomy with outside-cwd safety net.
-> Corresponding `index.ts` constants: `MODE_CONTEXT["auto"]`, `MODE_META["auto"]`, `tool_call` gate case `"auto"`.
+> **v2.2.0 (CC-aligned).** Tiered auto-approve with optional classifier, deny-and-continue on classifier blocks, and fail-closed when classifier is unavailable.
 
 ---
 
@@ -9,138 +8,111 @@
 
 ```typescript
 // MODE_META["auto"]
-{ icon: "▶", label: "Auto", role: "accent" }
+{ icon: "▶", label: "Auto", role: "warning" }
 ```
 
 - **Slash commands:** `/auto`
-- **Cycle position:** `ask → plan → auto → ask`
+- **Cycle position:** `ask → plan → auto → bypass → ask`
 - **Flag:** `--permission-mode auto`
-- **Auto-depth:** `/auto-depth <n>` — cap follow-up turns (`0` = unlimited; default 20)
 
 ---
 
-## 2. System context injection (`MODE_CONTEXT["auto"]`)
+## 2. System context injection
 
-Injected into the agent's context window at the start of every turn via `before_agent_start`. Unchanged from v1.0.0.
+Injected via `before_agent_start` anchor (`<!-- permission-modes:context -->`).
 
-```
-[AUTO MODE ACTIVE] All tool calls are auto-approved. Work autonomously without asking
-for permission until the task is complete. When everything is done, say the task is
-complete.
-```
+Auto mode also injects a **tool-output injection warning** (CC-aligned) and escalates when recent tool results match heuristic injection patterns.
 
 ---
 
-## 3. Auto-approve conditions
+## 3. Tiered auto-approve (v2.2.0)
 
-In auto mode, the following are **auto-approved** without any user prompt:
+| Tier | What auto-approves | Examples |
+|------|-------------------|----------|
+| **0** | Permission `allow` rules (dangerous broad rules stripped on auto entry) | `Bash(npm install *)` |
+| **1** | Read-only bash (`isSafeCommand`) | `ls`, `cat`, `git status`, `npm list` |
+| **1.5** | `autoMode.allow` patterns (all segments must pass tier-2 check) | user-configured |
+| **2** | Cwd内 `edit`/`write`; `isAutoApprovableBash` | `npm test`, `npm run build`, `git commit` |
+| **3** | Classifier + local risk fallback | `curl`, `npm install`, outside-cwd writes, unknown tools |
 
-| Event | Condition |
-|---|---|
-| `edit` / `write` | Path is **inside** cwd (`isOutsideCwd === false`) |
-| `read` | Any path (inside or outside cwd) |
-| `bash` (read-only) | `isSafeCommand(cmd) === true` |
-| `bash` (destructive) | Command targets **inside** cwd (`commandTargetsOutsideCwd === false`) |
-
----
-
-## 4. Auto-approve conditions (v1.1.3)
-
-In auto mode, the following are **auto-approved** without any user prompt:
-
-| Event | Condition |
-|---|---|
-| `edit` / `write` | Path is **inside** cwd (`isOutsideCwd === false`) |
-| `edit` / `write` (NEW v1.1.3) | Path is **outside** cwd — auto-approved but **tracked** via `trackOutsideWrite()` for `/undo-outside-writes` rollback |
-| `read` | Any path (inside or outside cwd) |
-| `bash` (read-only) | `isSafeCommand(cmd) === true` |
-| `bash` (destructive) | Command targets **inside** cwd (`commandTargetsOutsideCwd === false`) |
+**Removed from tier-1/2 (v2.2.0):** `curl`, `wget`, `npm install`, `git fetch/pull`, arbitrary `node`/`python`, `docker pull`.
 
 ---
 
-## 4a. Outside-cwd write tracking (NEW v1.1.3)
+## 4. Classifier behavior (v2.2.0)
 
-When auto mode approves an `edit`/`write` outside cwd:
-1. The file's pre-write content is read and saved as a snapshot JSON file in `<cwd>/.pi/projects/<project-id>/tmp/outside-writes/`
-2. If the file doesn't exist yet, `backupContent` is `null` (the undo action will delete the file)
-3. A notification is shown: `📝 tracked outside-cwd <tool>: <shortenedPath>`
-4. The snapshot is capped at 100 entries (LRU-evicts oldest; notification on eviction)
-
-### Undo commands
-
-| Command | Behavior |
-|---|---|
-| `/outside-writes` | List tracked writes (read-only) |
-| `/undo-outside-writes` | Interactive selector (newest first) |
-| `/undo-outside-writes all` | Restore all without prompting |
-| `/undo-outside-writes --list` | Alias for `/outside-writes` |
-
-### Restore behavior
-
-- `backupContent !== null`: Write the original content back to the file (creates parent dirs if needed)
-- `backupContent === null`: Delete the file (if it still exists)
-- Externally modified files: Restore anyway (snapshot is authoritative) + warn the user
+| Event | Behavior |
+|-------|----------|
+| Classifier **allows** | Auto-approve; reset consecutive denial counter |
+| Classifier **blocks** | **Deny-and-continue** — `{ block: true, reason: buildYoloRejectionMessage(...) }` (no approval UI) |
+| Classifier **unavailable** (3 retries) | **Fail-closed** by default (`classifier.failClosed: true`) |
+| 3 consecutive / 20 total classifier blocks | Escalate to **manual approval UI** |
+| Sensitive path / `soft_deny` / permission `ask` | Always **manual approval UI** |
 
 ---
 
-## 4b. UI confirmation prompts (v1.1.0)
-
-### 4b-i. Outside-cwd destructive bash prompt (unchanged from v1.1.0)
-
----
-
-## 5. Auto-follow-up (commented out in v1.0.0, stays commented in v1.1.0)
-
-The auto-continue logic in the `turn_end` handler is **commented out** in both v1.0.0 and v1.1.0. It will be re-enabled when pi's follow-up delivery support is confirmed stable.
-
-**Current code (commented):**
-
-```typescript
-// if (currentMode === "auto" && !isStepping) {
-//   if (autoFollowUpDepth > 0 && autoFollowUpCount >= autoFollowUpDepth) return;
-//   if (hasToolCalls(msg) && !isCompletionSignal(text)) {
-//     isStepping = true;
-//     autoFollowUpCount++;
-//     pi.sendUserMessage("Continue. Auto mode is active — proceed without asking.", {
-//       deliverAs: "followUp",
-//     });
-//   }
-// }
-```
-
----
-
-## 6. Decision tree (tool_call gate pseudocode, v1.1.3)
+## 5. Decision tree (tool_call gate)
 
 ```
 if currentMode === "auto":
-  if tool === "edit" || tool === "write":
-    if isOutsideCwd(path, ctx.cwd):
-      track snapshot + notify  # NEW v1.1.3 — was prompt
-      auto-approve
-    else:
-      auto-approve
-  elif tool === "bash":
-    if isSafeCommand(cmd):
-      auto-approve
-    elif commandTargetsOutsideCwd(cmd, ctx.cwd):
-      prompt 4b (outside-cwd destructive bash)
-    else:
-      auto-approve (destructive but inside cwd)
-  else:
-    auto-approve (read and other tools)
+  apply permission rules (dangerous allows stripped)
+  if read/grep/find/ls:
+    sensitive path → prompt UI
+    else → allow
+  if edit/write:
+    sensitive path → prompt UI
+    cwd内 → allow
+    outside cwd → tier-3 (classifier)
+  if bash:
+    sensitive ref → prompt UI
+    isSafeCommand → allow (tier-1)
+    autoMode.allow + isAutoApprovableBash → allow (tier-1.5)
+    autoMode.soft_deny → prompt UI
+    isAutoApprovableBash → allow (tier-2)
+    else → approveAutoTier3 (classifier / local / prompt)
 ```
 
 ---
 
-## 7. Related code locations
+## 6. Config (`~/.pi/agent/permission-modes.json`)
 
-| What | File | Line area |
-|---|---|---|
-| `MODE_CONTEXT["auto"]` | `index.ts` | `MODE_CONTEXT` record — unchanged |
-| `MODE_META["auto"]` | `index.ts` | `MODE_META` record — unchanged |
-| Outside-cwd edit/write prompt | `index.ts` | `tool_call` handler — `currentMode === "auto"` branch (NEW) |
-| Outside-cwd bash prompt | `index.ts` | `tool_call` handler — `currentMode === "auto"` branch (NEW) |
-| `isOutsideCwd()` | `utils.ts` | New helper for v1.1.0 |
-| `commandTargetsOutsideCwd()` | `utils.ts` | New helper for v1.1.0 |
-| Auto-follow-up (commented) | `index.ts` | `turn_end` handler |
+```json
+{
+  "classifier": {
+    "enabled": true,
+    "model": "anthropic/claude-haiku-4-5",
+    "timeoutMs": 20000,
+    "model": "CPA/Minimax/MiniMax-M2.7@tool",
+    "timeoutMs": 20000,
+    "failClosed": true,
+    "stage": "tool",
+    "includeAgentsMd": true
+  },
+  "autoMode": {
+    "allow": [],
+    "soft_deny": [],
+    "environment": []
+  }
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `classifier.failClosed` | `true` | Deny when classifier errors (iron gate) |
+| `classifier.stage` | `tool` | `tool` (forced `classify_result`, no API thinking) / `single` (JSON) / `fast` / `both` / `thinking` (XML pipelines) |
+| `classifier.model` suffix | — | `provider/model@tool` overrides `classifier.stage` for that model |
+| `classifier.includeAgentsMd` | `true` | Include AGENTS.md in classifier context |
+
+---
+
+## 7. Related code
+
+| What | File |
+|------|------|
+| Tier gate | `index.ts` `tool_call` auto branch |
+| Classifier client | `classifier-client.ts` |
+| Dangerous allow strip | `dangerous-permissions.ts` |
+| Denial tracking | `denial-tracking.ts` |
+| Deny messages | `classifier-messages.ts` |
+| Injection probe | `injection-probe.ts` |
+| Safe / approvable patterns | `utils.ts` |

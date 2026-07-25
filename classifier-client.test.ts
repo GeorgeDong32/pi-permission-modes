@@ -2,11 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
 	buildClassifierUserPrompt,
 	classifyToolCall,
+	parseClassifierModelRef,
 	parseClassifierVerdict,
 	parseModelRef,
+	resolveClassifierStage,
 	type ClassifierRegistry,
 	type ClassifierSessionContext,
 } from "./classifier-client.ts"
+import { CLASSIFIER_TOOL_NAME } from "./classifier-tool.ts"
 import { redactForClassifier } from "./classifier-redact.ts"
 
 const { completeSimpleMock } = vi.hoisted(() => ({
@@ -28,10 +31,26 @@ function session(
 	}
 }
 
-function makeAssistantResponse(text: string) {
+function makeAssistantResponse(
+	text: string,
+	extra?: Array<{
+		type: string
+		text?: string
+		thinking?: string
+		id?: string
+		name?: string
+		arguments?: Record<string, unknown>
+	}>,
+) {
 	return {
 		role: "assistant" as const,
-		content: [{ type: "text" as const, text }],
+		content:
+			extra ??
+			([{ type: "text" as const, text }] as Array<{
+				type: string
+				text?: string
+				thinking?: string
+			}>),
 		api: "anthropic-messages" as const,
 		provider: "test",
 		model: "test-model",
@@ -60,6 +79,35 @@ describe("parseModelRef", () => {
 	})
 })
 
+describe("parseClassifierModelRef", () => {
+	it("parses @tool stage suffix on model ref", () => {
+		expect(parseClassifierModelRef("CPA/Minimax/MiniMax-M2.7@tool")).toEqual({
+			provider: "CPA",
+			modelId: "Minimax/MiniMax-M2.7",
+			stageOverride: "tool",
+		})
+	})
+
+	it("parses @both stage suffix", () => {
+		expect(parseClassifierModelRef("anthropic/claude-haiku-4-5@both")).toEqual({
+			provider: "anthropic",
+			modelId: "claude-haiku-4-5",
+			stageOverride: "both",
+		})
+	})
+})
+
+describe("resolveClassifierStage", () => {
+	it("prefers model ref suffix over config", () => {
+		expect(resolveClassifierStage("test/model@single", "tool")).toBe("single")
+	})
+
+	it("falls back to config then tool default", () => {
+		expect(resolveClassifierStage("test/model", "both")).toBe("both")
+		expect(resolveClassifierStage("test/model")).toBe("tool")
+	})
+})
+
 describe("parseClassifierVerdict", () => {
 	it("parses CC shouldBlock JSON", () => {
 		expect(
@@ -84,6 +132,33 @@ describe("parseClassifierVerdict", () => {
 
 	it("returns null on bad JSON", () => {
 		expect(parseClassifierVerdict("not json")).toBeNull()
+	})
+
+	it("parses JSON embedded in prose", () => {
+		expect(
+			parseClassifierVerdict(
+				'Here is my verdict:\n{"shouldBlock":false,"reason":"routine dev command"}',
+			),
+		).toEqual({ allow: true, reason: "routine dev command" })
+	})
+
+	it("parses JSON with trailing comma", () => {
+		expect(
+			parseClassifierVerdict('{"shouldBlock": true, "reason": "risky",}'),
+		).toEqual({ allow: false, reason: "risky" })
+	})
+
+	it("parses legacy block field", () => {
+		expect(parseClassifierVerdict('{"block":false,"reason":"ok"}')).toEqual({
+			allow: true,
+			reason: "ok",
+		})
+	})
+
+	it("parses regex fallback when JSON is slightly malformed", () => {
+		expect(
+			parseClassifierVerdict('shouldBlock: false, reason: "looks fine"'),
+		).toEqual({ allow: true, reason: "looks fine" })
 	})
 })
 
@@ -132,6 +207,7 @@ describe("classifyToolCall", () => {
 			pendingTool: { name: "bash", input: { command: "npm test" } },
 			registry: makeRegistry(),
 			timeoutMs: 5000,
+			stage: "single",
 		})
 
 		expect(verdict.allow).toBe(true)
@@ -144,11 +220,78 @@ describe("classifyToolCall", () => {
 			text: expect.stringContaining("fix the bug"),
 		})
 		expect(context.messages[0]?.content[0].text).toContain("npm test")
+		expect(context.messages[0]?.content[0].text).toContain(
+			'Reply with one JSON object only',
+		)
 		expect(options).toMatchObject({
 			apiKey: "test-key",
 			maxTokens: 512,
 			temperature: 0,
 		})
+	})
+
+	it("uses classify_result tool in tool stage", async () => {
+		completeSimpleMock.mockResolvedValue(
+			makeAssistantResponse("", [
+				{
+					type: "toolCall",
+					id: "tc1",
+					name: CLASSIFIER_TOOL_NAME,
+					arguments: {
+						thinking: "routine test",
+						shouldBlock: false,
+						reason: "fine",
+					},
+				},
+			]),
+		)
+
+		const verdict = await classifyToolCall({
+			modelRef: "test/test-model",
+			session: session(),
+			pendingTool: { name: "bash", input: { command: "npm test" } },
+			registry: makeRegistry(),
+			timeoutMs: 5000,
+			stage: "tool",
+		})
+
+		expect(verdict).toEqual({
+			allow: true,
+			reason: "fine",
+			thinking: "routine test",
+		})
+
+		const [, context, options] = completeSimpleMock.mock.calls[0]!
+		expect(context.tools?.[0]?.name).toBe(CLASSIFIER_TOOL_NAME)
+		expect(options).toMatchObject({
+			thinkingEnabled: false,
+			toolChoice: { type: "tool", name: CLASSIFIER_TOOL_NAME },
+			maxTokens: 1024,
+		})
+		expect(context.messages[0]?.content[0].text).not.toContain(
+			"Reply with one JSON object only",
+		)
+	})
+
+	it("honors @single suffix on model ref over config stage", async () => {
+		completeSimpleMock.mockResolvedValue(
+			makeAssistantResponse('{"shouldBlock":false,"reason":"ok"}'),
+		)
+
+		await classifyToolCall({
+			modelRef: "test/test-model@single",
+			session: session(),
+			pendingTool: { name: "bash", input: { command: "ls" } },
+			registry: makeRegistry(),
+			timeoutMs: 5000,
+			stage: "tool",
+		})
+
+		const [, context] = completeSimpleMock.mock.calls[0]!
+		expect(context.tools).toBeUndefined()
+		expect(context.messages[0]?.content[0].text).toContain(
+			"Reply with one JSON object only",
+		)
 	})
 
 	it("auto-allows when tool has no classifier-relevant input", async () => {
@@ -174,8 +317,31 @@ describe("classifyToolCall", () => {
 			pendingTool: { name: "bash", input: { command: "rm -rf /" } },
 			registry: makeRegistry(),
 			timeoutMs: 5000,
+			stage: "single",
 		})
 		expect(verdict.allow).toBe(false)
+	})
+
+	it("parses verdict from thinking block when text is empty", async () => {
+		completeSimpleMock.mockResolvedValue(
+			makeAssistantResponse("", [
+				{
+					type: "thinking",
+					thinking:
+						'{"shouldBlock":false,"reason":"routine","thinking":"brief"}',
+				},
+			]),
+		)
+
+		const verdict = await classifyToolCall({
+			modelRef: "test/test-model",
+			session: session(),
+			pendingTool: { name: "bash", input: { command: "npm test" } },
+			registry: makeRegistry(),
+			timeoutMs: 5000,
+			stage: "single",
+		})
+		expect(verdict.allow).toBe(true)
 	})
 
 	it("throws when classifier returns unparseable JSON", async () => {
@@ -188,8 +354,51 @@ describe("classifyToolCall", () => {
 				pendingTool: { name: "bash", input: { command: "ls" } },
 				registry: makeRegistry(),
 				timeoutMs: 1000,
+				stage: "single",
 			}),
-		).rejects.toThrow(/unparseable JSON/)
+		).rejects.toThrow(/unparseable (JSON|tool result|XML\/JSON)/)
+	})
+
+	it("throws when tool stage returns no classify_result call", async () => {
+		completeSimpleMock.mockResolvedValue(makeAssistantResponse("not a tool"))
+
+		await expect(
+			classifyToolCall({
+				modelRef: "test/test-model",
+				session: session(),
+				pendingTool: { name: "bash", input: { command: "ls" } },
+				registry: makeRegistry(),
+				timeoutMs: 1000,
+				stage: "tool",
+			}),
+		).rejects.toThrow(/unparseable tool result/)
+	})
+
+	it("reports timeout when the deadline is exceeded", async () => {
+		completeSimpleMock.mockImplementation(
+			async (_model, _context, options) => {
+				await new Promise<void>((resolve) => {
+					options?.signal?.addEventListener("abort", () => resolve(), {
+						once: true,
+					})
+				})
+				return {
+					...makeAssistantResponse(""),
+					stopReason: "aborted" as const,
+				}
+			},
+		)
+
+		await expect(
+			classifyToolCall({
+				modelRef: "test/test-model",
+				session: session(),
+				pendingTool: { name: "bash", input: { command: "ls" } },
+				registry: makeRegistry(),
+				timeoutMs: 20,
+				stage: "single",
+			}),
+		).rejects.toThrow(/timed out after 20ms/)
 	})
 
 	it("throws when model is not found", async () => {

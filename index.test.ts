@@ -8,7 +8,7 @@
  * This lets us assert the gate decision tree without booting real pi.
  */
 
-import { describe, expect, it, beforeEach, vi } from "vitest"
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest"
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -22,6 +22,7 @@ import {
 	listTrackedOutsideWrites,
 	type OutsideWriteSnapshot,
 } from "./utils.ts"
+import { writePlanFile } from "./utils.ts"
 
 // ---- minimal fake pi API ------------------------------------------------
 
@@ -36,6 +37,7 @@ interface FakePi {
 	handlers: Map<string, Handler[]>
 	commands: Map<string, CommandHandler>
 	shortcuts: Map<string, Handler>
+	tools: Map<string, { name: string; execute: (...args: unknown[]) => Promise<unknown> }>
 	userMessages: Array<{ text: string; opts?: unknown }>
 	sentMessages: Array<{
 		message: { customType?: string; content?: unknown; display?: boolean }
@@ -58,6 +60,11 @@ interface FakePi {
 		input: Record<string, unknown>,
 		ctx: object,
 	) => Promise<unknown>
+	simulateRegisteredTool: (
+		toolName: string,
+		params: Record<string, unknown>,
+		ctx: object,
+	) => Promise<unknown>
 	simulateCommand: (name: string, args: string, ctx: object) => Promise<unknown>
 	simulateShortcut: (
 		key: string,
@@ -71,6 +78,7 @@ interface FakeCtxOptions {
 	projectRoot?: string | null
 	ui?: {
 		select?: (label: string, options: string[]) => Promise<string>
+		custom?: <T>(factory: unknown, options?: unknown) => Promise<T>
 		notify?: (msg: string) => void
 		editor?: (label: string, val: string) => Promise<string | undefined>
 	}
@@ -80,6 +88,7 @@ function createFakePi(): FakePi {
 	const handlers = new Map<string, Handler[]>()
 	const commands = new Map<string, CommandHandler>()
 	const shortcuts = new Map<string, Handler>()
+	const tools = new Map<string, { name: string; execute: (...args: unknown[]) => Promise<unknown> }>()
 	const userMessages: Array<{ text: string; opts?: unknown }> = []
 	const sentMessages: Array<{
 		message: { customType?: string; content?: unknown; display?: boolean }
@@ -96,6 +105,7 @@ function createFakePi(): FakePi {
 		handlers,
 		commands,
 		shortcuts,
+		tools,
 		userMessages,
 		sentMessages,
 		appendEntries,
@@ -125,7 +135,9 @@ function createFakePi(): FakePi {
 		registerShortcut(key: string, def: { handler: Handler }) {
 			shortcuts.set(key, def.handler)
 		},
-		registerTool(_def: unknown) {},
+		registerTool(def: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) {
+			tools.set(def.name, def)
+		},
 		registerFlag(name: string, def: { default?: unknown }) {
 			// Always record the flag so the extension can read it via getFlag.
 			// Default is honored when provided.
@@ -191,6 +203,15 @@ function createFakePi(): FakePi {
 			if (!handler) throw new Error(`No command registered: ${name}`)
 			return handler(args, ctx)
 		},
+		async simulateRegisteredTool(
+			toolName: string,
+			params: Record<string, unknown>,
+			ctx: object,
+		) {
+			const tool = tools.get(toolName)
+			if (!tool) throw new Error(`No tool registered: ${toolName}`)
+			return tool.execute("test-call", params, undefined, undefined, ctx)
+		},
 		async simulateShortcut(key: string, ctx: object) {
 			const handler = shortcuts.get(key)
 			if (!handler) throw new Error(`No shortcut registered: ${key}`)
@@ -219,6 +240,7 @@ function makeCtx(
 		modelRegistry: opts.modelRegistry ?? p.modelRegistry,
 		ui: {
 			select: ui.select ?? (async () => "Block"),
+			custom: ui.custom ?? (async () => "stay" as never),
 			notify: ui.notify ?? (() => {}),
 			editor: ui.editor ?? (async () => undefined),
 			setStatus: () => {},
@@ -245,9 +267,16 @@ function makeCtx(
 describe("permission-modes extension: tool_call gate", () => {
 	let pi: FakePi
 	let realProjectRoot: string
+	let configTmp: string
 
 	beforeEach(async () => {
 		pi = createFakePi()
+		configTmp = mkdtempSync(join(tmpdir(), "pm-idx-cfg-"))
+		setConfigPath(join(configTmp, "permission-modes.json"))
+		writeFileSync(
+			join(configTmp, "permission-modes.json"),
+			JSON.stringify({ classifier: { enabled: false } }),
+		)
 		// Use real fs: the current repo IS a project (has package.json).
 		realProjectRoot = process.cwd()
 		permissionModesExtension(makeFakePiForExtension(pi))
@@ -338,10 +367,159 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(result).toBeUndefined()
 		})
 
+		it("auto-approves ls tool (including outside cwd)", async () => {
+			await switchMode("plan")
+			const inside = await callToolCall("ls", { path: "src" })
+			expect(inside).toBeUndefined()
+			const outside = await callToolCall("ls", { path: "/tmp" })
+			expect(outside).toBeUndefined()
+		})
+
+		it("enables ls in active tools after entering plan mode", async () => {
+			expect(pi.activeTools.includes("ls")).toBe(false)
+			await switchMode("plan")
+			expect(pi.activeTools).toEqual(
+				expect.arrayContaining(["read", "bash", "grep", "find", "ls", "plan_ready"]),
+			)
+		})
+
+		it("re-applies plan tools on before_agent_start", async () => {
+			await switchMode("plan")
+			pi.activeTools.length = 0
+			pi.activeTools.push("read", "bash")
+			const handler = pi.handlers.get("before_agent_start")?.[0]
+			expect(handler).toBeDefined()
+			await handler!(
+				{ systemPrompt: "" },
+				makeCtx(pi, { cwd: realProjectRoot, ui: {} }),
+			)
+			expect(pi.activeTools).toEqual(expect.arrayContaining(["ls", "grep", "find"]))
+		})
+
 		it("blocks destructive bash", async () => {
 			await switchMode("plan")
 			const result = await callToolCall("bash", { command: "rm -rf /" })
 			expect(result).toMatchObject({ block: true })
+		})
+	})
+
+	describe("plan_ready tool", () => {
+		let tmpCwd: string
+
+		function makePlanBody(lineCount: number, suffix = ""): string {
+			const steps = Array.from(
+				{ length: lineCount },
+				(_, i) => `${i + 1}. Implement feature number ${i + 1}${suffix}`,
+			).join("\n")
+			return `**Plan:**\n${steps}`
+		}
+
+		beforeEach(() => {
+			tmpCwd = mkdtempSync(join(tmpdir(), "pi-plan-ready-"))
+		})
+
+		afterEach(() => {
+			rmSync(tmpCwd, { recursive: true, force: true })
+		})
+
+		it("uses ui.custom instead of stuffing plan content into ui.select title", async () => {
+			await switchMode("plan")
+			writePlanFile(tmpCwd, makePlanBody(200, " " + "x".repeat(80)))
+
+			let selectCalled = false
+			let customCalled = false
+			let customPlanContent = ""
+
+			const ctx = makeCtx(pi, {
+				cwd: tmpCwd,
+				ui: {
+					select: async (title) => {
+						selectCalled = true
+						expect(title.length).toBeLessThan(200)
+						return "Execute the plan"
+					},
+					custom: async (factory) => {
+						customCalled = true
+						const mockTui = {
+							terminal: {
+								rows: 24,
+								columns: 80,
+								write: () => {},
+							},
+							requestRender: () => {},
+						}
+						const mockTheme = {
+							fg: (_role: string, text: string) => text,
+							bold: (text: string) => text,
+							italic: (text: string) => text,
+							strikethrough: (text: string) => text,
+							underline: (text: string) => text,
+						}
+						const component = await (factory as Function)(mockTui, mockTheme, {}, () => {})
+						customPlanContent = component.render(80).join("\n")
+						return "execute"
+					},
+				},
+			})
+
+			const result = await pi.simulateRegisteredTool("plan_ready", { summary: "Ship it" }, ctx)
+
+			expect(customCalled).toBe(true)
+			expect(selectCalled).toBe(false)
+			expect(customPlanContent).toContain("Plan ready")
+			expect(customPlanContent).toContain("Implement feature")
+			expect(result).toMatchObject({ terminate: true })
+			expect(pi.sentMessages.some((m) => m.message.customType === "modes-execute")).toBe(true)
+		})
+
+		it("refine opens editor and submits a follow-up user message", async () => {
+			await switchMode("plan")
+			writePlanFile(tmpCwd, makePlanBody(5))
+
+			let editorCalled = false
+			const ctx = makeCtx(pi, {
+				cwd: tmpCwd,
+				ui: {
+					custom: async () => "refine",
+					editor: async (title) => {
+						editorCalled = true
+						expect(title).toBe("Refine the plan:")
+						return "Please add rollback steps"
+					},
+				},
+			})
+
+			const result = await pi.simulateRegisteredTool("plan_ready", {}, ctx)
+			expect(editorCalled).toBe(true)
+			expect(result).toMatchObject({ terminate: true })
+			expect(pi.userMessages).toEqual([
+				expect.objectContaining({
+					text: "Please add rollback steps",
+					opts: { deliverAs: "followUp" },
+				}),
+			])
+		})
+
+		it("stay and cancel close the dialog without triggering execution", async () => {
+			await switchMode("plan")
+			writePlanFile(tmpCwd, makePlanBody(3))
+
+			for (const choice of ["stay", "cancel"] as const) {
+				pi.userMessages.length = 0
+				pi.sentMessages.length = 0
+
+				const ctx = makeCtx(pi, {
+					cwd: tmpCwd,
+					ui: {
+						custom: async () => choice,
+					},
+				})
+
+				const result = await pi.simulateRegisteredTool("plan_ready", {}, ctx)
+				expect(result).toMatchObject({ terminate: true })
+				expect(pi.userMessages).toHaveLength(0)
+				expect(pi.sentMessages.some((m) => m.message.customType === "modes-execute")).toBe(false)
+			}
 		})
 	})
 
@@ -392,21 +570,20 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(result).toBeUndefined()
 		})
 
-		it("prompts on curl bash (network blacklist)", async () => {
+		it("prompts on curl bash (tier 3)", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("bash", {
 				command: "curl https://example.com",
 			})
-			// curl is in the read-only SAFE_PATTERNS list → tier 1.5 auto-approve
-			expect(result).toBeUndefined()
+			expect(result).toMatchObject({ block: true })
 		})
 
-		it("auto-approves npm install via isAutoApprovableBash", async () => {
+		it("prompts on npm install (tier 3)", async () => {
 			await switchMode("auto")
 			const result = await callToolCall("bash", {
 				command: "npm install lodash",
 			})
-			expect(result).toBeUndefined()
+			expect(result).toMatchObject({ block: true })
 		})
 
 		it("prompts on dangerous bash not covered by auto-approvable", async () => {
@@ -464,6 +641,28 @@ describe("permission-modes extension: tool_call gate", () => {
 			})
 			expect(result).toMatchObject({ block: true })
 		})
+
+		it("fail-closed when classifier is unavailable", async () => {
+			writeFileSync(
+				join(configTmp, "permission-modes.json"),
+				JSON.stringify({
+					classifier: {
+						enabled: true,
+						model: "test/missing-model",
+						timeoutMs: 1000,
+						failClosed: true,
+					},
+				}),
+			)
+			await switchMode("auto")
+			const risky = await callToolCall("bash", {
+				command: "npm install lodash",
+			})
+			expect(risky).toMatchObject({ block: true })
+			expect(String((risky as { reason?: string })?.reason)).toContain(
+				"temporarily unavailable",
+			)
+		})
 	})
 
 	describe("permission rules", () => {
@@ -472,6 +671,10 @@ describe("permission-modes extension: tool_call gate", () => {
 		beforeEach(() => {
 			configTmp = mkdtempSync(join(tmpdir(), "pm-idx-perm-"))
 			setConfigPath(join(configTmp, "permission-modes.json"))
+			writeFileSync(
+				join(configTmp, "permission-modes.json"),
+				JSON.stringify({ classifier: { enabled: false } }),
+			)
 		})
 
 		it("allow rule bypasses auto-mode prompt for matching bash", async () => {
@@ -499,6 +702,24 @@ describe("permission-modes extension: tool_call gate", () => {
 			expect(String((result as { reason?: string })?.reason)).toContain(
 				"Denied by permission rule",
 			)
+		})
+
+		it("strips dangerous Bash allow rules in auto mode", async () => {
+			writeProjectPermissionsFile(realProjectRoot, {
+				allow: ["Bash(python:*)", "Bash(npm install *)"],
+			})
+			await pi.simulateSessionStart(realProjectRoot)
+			await switchMode("auto")
+			const viaSpecificAllow = await callToolCall(
+				"bash",
+				{ command: "npm install -g @scope/pkg" },
+			)
+			expect(viaSpecificAllow).toBeUndefined()
+			const python = await callToolCall(
+				"bash",
+				{ command: 'python -c "print(1)"' },
+			)
+			expect(python).toMatchObject({ block: true })
 		})
 	})
 
