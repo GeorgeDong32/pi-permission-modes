@@ -17,7 +17,12 @@ export type PlanApprovalChoice = "execute" | "refine" | "stay" | "cancel";
 
 export const MAX_PLAN_CHARS = 200_000;
 export const MIN_PLAN_VIEWPORT_LINES = 6;
-export const FULLSCREEN_CHROME_RESERVE = 14;
+/** Fixed chrome above/below the scrollable plan (borders, title, options, footer). */
+export const DIALOG_CHROME_RESERVE = 14;
+/** @deprecated Use DIALOG_CHROME_RESERVE */
+export const FULLSCREEN_CHROME_RESERVE = DIALOG_CHROME_RESERVE;
+/** Cap the dialog to half the terminal so chat stays visible and options sit at the bottom. */
+export const DIALOG_MAX_HEIGHT_RATIO = 0.5;
 
 const OPTIONS = [
   { label: "Execute the plan", choice: "execute" as const },
@@ -32,12 +37,15 @@ const MOUSE_ENABLE = "\x1b[?1000h\x1b[?1006h";
 const MOUSE_DISABLE = "\x1b[?1000l\x1b[?1006l";
 
 export function computeMaxRenderLines(termRows: number): number {
-  return Math.max(1, termRows);
+  const half = Math.floor(termRows * DIALOG_MAX_HEIGHT_RATIO);
+  const minNeeded = DIALOG_CHROME_RESERVE + MIN_PLAN_VIEWPORT_LINES;
+  return Math.max(1, Math.min(termRows, Math.max(half, Math.min(minNeeded, termRows))));
 }
 
 export function computePlanViewportLines(termRows: number, hasSummary = false): number {
-  const fixedChrome = FULLSCREEN_CHROME_RESERVE + (hasSummary ? 1 : 0);
-  return Math.max(MIN_PLAN_VIEWPORT_LINES, termRows - fixedChrome);
+  const maxRender = computeMaxRenderLines(termRows);
+  const fixedChrome = DIALOG_CHROME_RESERVE + (hasSummary ? 1 : 0);
+  return Math.max(MIN_PLAN_VIEWPORT_LINES, maxRender - fixedChrome);
 }
 
 export function truncatePlanContent(planContent: string): {
@@ -115,6 +123,8 @@ export async function runPlanApprovalDialog(
     stepCount: number;
   },
 ): Promise<PlanApprovalChoice> {
+  // Bottom-anchored overlay (not editor-slot fullscreen). Padding the dialog to
+  // the full terminal height left options floating mid-screen.
   return ctx.ui.custom<PlanApprovalChoice>(
     (tui, theme, _kb, done) =>
       createPlanApprovalComponent({
@@ -125,6 +135,15 @@ export async function runPlanApprovalDialog(
         tui,
         done,
       }),
+    {
+      overlay: true,
+      overlayOptions: {
+        anchor: "bottom-center",
+        width: "100%",
+        maxHeight: `${Math.round(DIALOG_MAX_HEIGHT_RATIO * 100)}%`,
+        margin: { bottom: 0, left: 0, right: 0, top: 0 },
+      },
+    },
   );
 }
 
@@ -290,15 +309,10 @@ class PlanApprovalComponent implements Component {
     push(dim(FOOTER));
     push(border("─".repeat(innerWidth)));
 
-    while (lines.length < maxRenderLines) {
-      lines.push("");
-    }
-
-    if (lines.length > maxRenderLines) {
-      this.cachedLines = lines.slice(0, maxRenderLines);
-    } else {
-      this.cachedLines = lines;
-    }
+    // Do not pad with trailing blank lines — that pushed options up and made the
+    // dialog look like it was floating in the middle of the terminal.
+    this.cachedLines =
+      lines.length > maxRenderLines ? lines.slice(0, maxRenderLines) : lines;
     this.cachedWidth = width;
     return this.cachedLines;
   }

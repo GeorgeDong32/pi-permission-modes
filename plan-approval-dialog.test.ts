@@ -35,15 +35,16 @@ function makeMockTui(rows: number, columns = 80): TUI {
 }
 
 describe("plan-approval-dialog layout helpers", () => {
-  it("computePlanViewportLines uses most of the terminal height", () => {
-    const viewport = computePlanViewportLines(24);
+  it("computePlanViewportLines uses half-terminal budget minus chrome", () => {
+    const viewport = computePlanViewportLines(40);
     expect(viewport).toBeGreaterThanOrEqual(MIN_PLAN_VIEWPORT_LINES);
-    expect(viewport).toBe(24 - FULLSCREEN_CHROME_RESERVE);
+    expect(viewport).toBe(computeMaxRenderLines(40) - FULLSCREEN_CHROME_RESERVE);
   });
 
-  it("computeMaxRenderLines uses the full terminal height", () => {
-    expect(computeMaxRenderLines(24)).toBe(24);
-    expect(computeMaxRenderLines(40)).toBe(40);
+  it("computeMaxRenderLines caps around half the terminal height", () => {
+    expect(computeMaxRenderLines(40)).toBeLessThanOrEqual(20);
+    expect(computeMaxRenderLines(24)).toBeLessThanOrEqual(24);
+    expect(computeMaxRenderLines(24)).toBeGreaterThanOrEqual(MIN_PLAN_VIEWPORT_LINES);
   });
 
   it("truncatePlanContent leaves short plans untouched", () => {
@@ -68,7 +69,7 @@ describe("plan-approval-dialog layout helpers", () => {
 });
 
 describe("plan-approval-dialog component", () => {
-  it("render output fills the terminal height for large plans", () => {
+  it("render output stays within half-terminal budget and keeps options at the bottom", () => {
     const termRows = 24;
     const tui = makeMockTui(termRows);
     const planContent = `**Plan:**\n${Array.from({ length: 500 }, (_, i) => `${i + 1}. Implement feature number ${i + 1} ${"A".repeat(120)}`).join("\n")}`;
@@ -82,7 +83,13 @@ describe("plan-approval-dialog component", () => {
     });
 
     const lines = component.render(80);
-    expect(lines.length).toBe(termRows);
+    const maxLines = computeMaxRenderLines(termRows);
+    expect(lines.length).toBeLessThanOrEqual(maxLines);
+    expect(lines.length).toBeLessThan(termRows);
+    // No trailing blank padding that would float options mid-screen
+    expect(lines[lines.length - 1]?.trim().length).toBeGreaterThan(0);
+    expect(lines.some((line) => line.includes("Stay in plan mode"))).toBe(true);
+    expect(lines.some((line) => line.includes("Execute the plan"))).toBe(true);
   });
 
   it("render output stays within terminal line budget for large plans", () => {

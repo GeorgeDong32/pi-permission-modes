@@ -136,6 +136,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   let planPhase: PlanPhase = "exploring";
   let lastExtractedPlanHash = "";
   let lastPlanOfferAt = 0;
+  /** Suppress agent_end re-offer after the user dismisses plan approval (Stay/Esc/Refine). */
+  let suppressPlanOfferUntil = 0;
   const PLAN_OFFER_COOLDOWN_MS = 60_000;
   let needsAskReminder = false;
   let needsBypassSecurityReminder = false;
@@ -956,6 +958,15 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   });
 
   // ---- plan approval helpers ---------------------------------------------
+  function markPlanOfferHandled(planContent: string): void {
+    lastPlanOfferAt = Date.now();
+    // Keep agent_end from immediately re-opening the same plan dialog after Stay/Esc.
+    suppressPlanOfferUntil = Date.now() + PLAN_OFFER_COOLDOWN_MS;
+    if (planContent) {
+      lastExtractedPlanHash = hashPlan(planContent);
+    }
+  }
+
   async function promptPlanRefinement(ctx: ExtensionContext): Promise<void> {
     if (!ctx.hasUI) return;
     planPhase = "refining";
@@ -1030,12 +1041,14 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         };
       }
 
-      lastPlanOfferAt = Date.now();
+      // Suppress agent_end re-offer while this dialog is open and after dismiss.
+      markPlanOfferHandled(planContent ?? "");
       const choice = await runPlanApprovalDialog(ctx, {
         summary,
         planContent: planContent ?? "",
         stepCount: extracted.length,
       });
+      markPlanOfferHandled(planContent ?? "");
 
       if (choice === "execute") {
         planExecuting = true;
@@ -1065,7 +1078,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         return planReviewClosedToolResult();
       }
 
-      // stay | cancel (Esc): close dialog and return to the input prompt.
+      // stay | cancel (Esc): one dismiss returns to the input prompt.
       return planReviewClosedToolResult();
     },
     renderCall(args, theme) {
@@ -1822,8 +1835,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
     if (!extracted.length) return;
 
-    // Cooldown: don't re-offer within 60s of the last offer.
+    // Cooldown / Stay dismiss: don't re-offer within 60s of the last offer.
     if (Date.now() - lastPlanOfferAt < PLAN_OFFER_COOLDOWN_MS) return;
+    if (Date.now() < suppressPlanOfferUntil) return;
 
     const syncedContent = readPlanFile(ctx.cwd) ?? planContent ?? "";
     const contentHash = hashPlan(
@@ -1833,15 +1847,16 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     const changed = contentHash !== lastExtractedPlanHash;
     if (!isFirst && !changed) return;
 
-    lastExtractedPlanHash = contentHash;
     planTodos = extracted;
     persistState();
 
-    lastPlanOfferAt = Date.now();
+    // Mark before await so a concurrent agent_end cannot open a second dialog.
+    markPlanOfferHandled(syncedContent || JSON.stringify(extracted));
     const choice = await runPlanApprovalDialog(ctx, {
       planContent: syncedContent,
       stepCount: extracted.length,
     });
+    markPlanOfferHandled(syncedContent || JSON.stringify(extracted));
 
     if (choice === "execute") {
       planExecuting = true;
