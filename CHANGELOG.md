@@ -12,6 +12,7 @@
 - **Plan ready dialog floating mid-screen**: stop padding the dialog to the full terminal height (which pushed options upward). Use a bottom-anchored overlay (`anchor: bottom-center`, `maxHeight: 50%`) with options fixed at the bottom of the panel.
 - **Stay in plan mode needing two dismisses**: after Stay/Esc/Refine, sync the plan hash and suppress `agent_end` re-offer for the cooldown window so the dialog does not immediately reopen.
 
+[2.4.2]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.4.0...v2.4.1
 
 ## [2.4.0] - 2026-07-25
