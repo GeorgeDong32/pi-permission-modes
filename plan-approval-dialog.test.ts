@@ -6,7 +6,9 @@ import {
   computeMaxRenderLines,
   computePlanViewportLines,
   createPlanApprovalComponent,
-  FULLSCREEN_CHROME_RESERVE,
+  DIALOG_MAX_HEIGHT_RATIO,
+  FOOTER_CHROME_LINES,
+  HEADER_BASE_LINES,
   MAX_PLAN_CHARS,
   MIN_PLAN_VIEWPORT_LINES,
   parseMouseWheelDelta,
@@ -35,16 +37,20 @@ function makeMockTui(rows: number, columns = 80): TUI {
 }
 
 describe("plan-approval-dialog layout helpers", () => {
-  it("computePlanViewportLines uses half-terminal budget minus chrome", () => {
-    const viewport = computePlanViewportLines(40);
-    expect(viewport).toBeGreaterThanOrEqual(MIN_PLAN_VIEWPORT_LINES);
-    expect(viewport).toBe(computeMaxRenderLines(40) - FULLSCREEN_CHROME_RESERVE);
+  it("computeMaxRenderLines targets ~92% of the terminal", () => {
+    expect(DIALOG_MAX_HEIGHT_RATIO).toBe(0.92);
+    expect(computeMaxRenderLines(50)).toBe(Math.floor(50 * 0.92));
+    expect(computeMaxRenderLines(40)).toBe(Math.floor(40 * 0.92));
+    expect(computeMaxRenderLines(24)).toBeGreaterThanOrEqual(MIN_PLAN_VIEWPORT_LINES);
+    expect(computeMaxRenderLines(24)).toBeLessThanOrEqual(24);
   });
 
-  it("computeMaxRenderLines caps around half the terminal height", () => {
-    expect(computeMaxRenderLines(40)).toBeLessThanOrEqual(20);
-    expect(computeMaxRenderLines(24)).toBeLessThanOrEqual(24);
-    expect(computeMaxRenderLines(24)).toBeGreaterThanOrEqual(MIN_PLAN_VIEWPORT_LINES);
+  it("computePlanViewportLines leaves room for sticky footer chrome", () => {
+    const viewport = computePlanViewportLines(40);
+    expect(viewport).toBeGreaterThanOrEqual(MIN_PLAN_VIEWPORT_LINES);
+    // header base + scroll status + footer (no summary/trunc)
+    const chrome = HEADER_BASE_LINES + 1 + FOOTER_CHROME_LINES;
+    expect(viewport).toBe(computeMaxRenderLines(40) - chrome);
   });
 
   it("truncatePlanContent leaves short plans untouched", () => {
@@ -69,8 +75,8 @@ describe("plan-approval-dialog layout helpers", () => {
 });
 
 describe("plan-approval-dialog component", () => {
-  it("render output stays within half-terminal budget and keeps options at the bottom", () => {
-    const termRows = 24;
+  it("fills the 92% panel and pins options to the bottom", () => {
+    const termRows = 40;
     const tui = makeMockTui(termRows);
     const planContent = `**Plan:**\n${Array.from({ length: 500 }, (_, i) => `${i + 1}. Implement feature number ${i + 1} ${"A".repeat(120)}`).join("\n")}`;
 
@@ -84,12 +90,35 @@ describe("plan-approval-dialog component", () => {
 
     const lines = component.render(80);
     const maxLines = computeMaxRenderLines(termRows);
-    expect(lines.length).toBeLessThanOrEqual(maxLines);
-    expect(lines.length).toBeLessThan(termRows);
-    // No trailing blank padding that would float options mid-screen
-    expect(lines[lines.length - 1]?.trim().length).toBeGreaterThan(0);
+    expect(lines.length).toBe(maxLines);
+    expect(maxLines).toBeGreaterThan(termRows * 0.8);
+
+    // Sticky footer: last lines are border / footer / options — not blank padding
+    expect(lines[lines.length - 1]?.includes("─")).toBe(true);
     expect(lines.some((line) => line.includes("Stay in plan mode"))).toBe(true);
     expect(lines.some((line) => line.includes("Execute the plan"))).toBe(true);
+
+    const stayIdx = lines.findIndex((line) => line.includes("Stay in plan mode"));
+    const executeIdx = lines.findIndex((line) => line.includes("Execute the plan"));
+    expect(stayIdx).toBeGreaterThan(executeIdx);
+    expect(lines.length - stayIdx).toBeLessThanOrEqual(4);
+  });
+
+  it("pads short plans above the options so the footer stays pinned", () => {
+    const termRows = 40;
+    const tui = makeMockTui(termRows);
+    const component = createPlanApprovalComponent({
+      planContent: "**Plan:**\n1. Tiny step",
+      stepCount: 1,
+      theme: makeMockTheme(),
+      tui,
+      done: () => {},
+    });
+
+    const lines = component.render(80);
+    expect(lines.length).toBe(computeMaxRenderLines(termRows));
+    expect(lines.some((line) => line.includes("Stay in plan mode"))).toBe(true);
+    expect(lines[lines.length - 1]?.trim().length).toBeGreaterThan(0);
   });
 
   it("render output stays within terminal line budget for large plans", () => {

@@ -17,12 +17,23 @@ export type PlanApprovalChoice = "execute" | "refine" | "stay" | "cancel";
 
 export const MAX_PLAN_CHARS = 200_000;
 export const MIN_PLAN_VIEWPORT_LINES = 6;
-/** Fixed chrome above/below the scrollable plan (borders, title, options, footer). */
-export const DIALOG_CHROME_RESERVE = 14;
+/** Top border + title + separator. */
+export const HEADER_BASE_LINES = 3;
+/** Separator + 3 options + shortcut footer + bottom border. */
+export const FOOTER_CHROME_LINES = 6;
+/**
+ * Conservative chrome budget (header base + summary + trunc + scroll status + footer).
+ * Used as a floor when sizing short terminals.
+ */
+export const DIALOG_CHROME_RESERVE =
+  HEADER_BASE_LINES + 1 + 1 + 1 + FOOTER_CHROME_LINES;
 /** @deprecated Use DIALOG_CHROME_RESERVE */
 export const FULLSCREEN_CHROME_RESERVE = DIALOG_CHROME_RESERVE;
-/** Cap the dialog to half the terminal so chat stays visible and options sit at the bottom. */
-export const DIALOG_MAX_HEIGHT_RATIO = 0.5;
+/**
+ * Near-fullscreen panel (Cursor / Claude Code style). Leaves a thin strip of
+ * chat visible above; options stay pinned to the bottom of the panel.
+ */
+export const DIALOG_MAX_HEIGHT_RATIO = 0.92;
 
 const OPTIONS = [
   { label: "Execute the plan", choice: "execute" as const },
@@ -37,15 +48,27 @@ const MOUSE_ENABLE = "\x1b[?1000h\x1b[?1006h";
 const MOUSE_DISABLE = "\x1b[?1000l\x1b[?1006l";
 
 export function computeMaxRenderLines(termRows: number): number {
-  const half = Math.floor(termRows * DIALOG_MAX_HEIGHT_RATIO);
+  const target = Math.floor(termRows * DIALOG_MAX_HEIGHT_RATIO);
   const minNeeded = DIALOG_CHROME_RESERVE + MIN_PLAN_VIEWPORT_LINES;
-  return Math.max(1, Math.min(termRows, Math.max(half, Math.min(minNeeded, termRows))));
+  return Math.max(1, Math.min(termRows, Math.max(target, Math.min(minNeeded, termRows))));
 }
 
-export function computePlanViewportLines(termRows: number, hasSummary = false): number {
+export function computeHeaderChromeLines(hasSummary = false, truncated = false): number {
+  return HEADER_BASE_LINES + (hasSummary ? 1 : 0) + (truncated ? 1 : 0);
+}
+
+/**
+ * Scrollable plan rows inside the panel. Reserves one line for a scroll status
+ * row so the option footer can stay pinned at the bottom.
+ */
+export function computePlanViewportLines(
+  termRows: number,
+  hasSummary = false,
+  truncated = false,
+): number {
   const maxRender = computeMaxRenderLines(termRows);
-  const fixedChrome = DIALOG_CHROME_RESERVE + (hasSummary ? 1 : 0);
-  return Math.max(MIN_PLAN_VIEWPORT_LINES, maxRender - fixedChrome);
+  const chrome = computeHeaderChromeLines(hasSummary, truncated) + 1 + FOOTER_CHROME_LINES;
+  return Math.max(MIN_PLAN_VIEWPORT_LINES, maxRender - chrome);
 }
 
 export function truncatePlanContent(planContent: string): {
@@ -123,8 +146,7 @@ export async function runPlanApprovalDialog(
     stepCount: number;
   },
 ): Promise<PlanApprovalChoice> {
-  // Bottom-anchored overlay (not editor-slot fullscreen). Padding the dialog to
-  // the full terminal height left options floating mid-screen.
+  // Near-fullscreen bottom-anchored overlay: tall scrollable plan + sticky options.
   return ctx.ui.custom<PlanApprovalChoice>(
     (tui, theme, _kb, done) =>
       createPlanApprovalComponent({
@@ -200,6 +222,7 @@ class PlanApprovalComponent implements Component {
     const viewportLines = computePlanViewportLines(
       this.tui.terminal.rows,
       !!this.summary,
+      this.truncated,
     );
 
     const wheelDelta = parseMouseWheelDelta(keyData);
@@ -248,71 +271,102 @@ class PlanApprovalComponent implements Component {
 
     const termRows = this.tui.terminal.rows;
     const maxRenderLines = computeMaxRenderLines(termRows);
-    const viewportLines = computePlanViewportLines(termRows, !!this.summary);
     const innerWidth = Math.max(20, width - 2);
     const planLines = this.getPlanLines(width);
-    const maxScroll = Math.max(0, planLines.length - viewportLines);
-    this.scrollOffset = Math.min(this.scrollOffset, maxScroll);
 
     const accent = (text: string) => this.theme.fg("accent", text);
     const muted = (text: string) => this.theme.fg("muted", text);
     const dim = (text: string) => this.theme.fg("dim", text);
     const bold = (text: string) => this.theme.bold(text);
     const border = (text: string) => this.theme.fg("border", text);
+    const clip = (line: string) => truncateToWidth(line, innerWidth, "…", true);
 
-    const lines: string[] = [];
-    const push = (line: string) => {
-      lines.push(truncateToWidth(line, innerWidth, "…", true));
-    };
-
-    push(border("─".repeat(innerWidth)));
-
-    push(accent(bold(`Plan ready (${this.stepCount} steps)`)));
-    if (this.summary) {
-      push(muted(this.summary));
-    }
-
-    push(dim("─".repeat(Math.min(innerWidth, 60))));
-
-    if (this.truncated) {
-      push(this.theme.fg("warning", "… truncated, see plan.md for full content"));
-    }
-
-    if (planLines.length > viewportLines) {
-      const start = this.scrollOffset + 1;
-      const end = Math.min(this.scrollOffset + viewportLines, planLines.length);
-      push(dim(`▲ plan ${start}-${end}/${planLines.length} · mouse/PgUp/PgDn`));
-    }
-
-    const visiblePlan = planLines.slice(
-      this.scrollOffset,
-      this.scrollOffset + viewportLines,
-    );
-    for (const line of visiblePlan) {
-      push(line);
-    }
-
-    if (planLines.length > viewportLines && this.scrollOffset < maxScroll) {
-      push(dim(`▼ ${planLines.length - (this.scrollOffset + viewportLines)} more lines`));
-    }
-
-    push(dim("─".repeat(Math.min(innerWidth, 60))));
-
+    // --- sticky footer (fixed) ---
+    const footer: string[] = [
+      clip(dim("─".repeat(Math.min(innerWidth, 60)))),
+    ];
     for (let i = 0; i < OPTIONS.length; i++) {
       const opt = OPTIONS[i]!;
       const selected = i === this.selectedIndex;
       const prefix = selected ? accent("→ ") : "  ";
       const label = selected ? accent(opt.label) : this.theme.fg("text", opt.label);
-      push(prefix + label);
+      footer.push(clip(prefix + label));
+    }
+    footer.push(clip(dim(FOOTER)));
+    footer.push(clip(border("─".repeat(innerWidth))));
+
+    // --- header (fixed) ---
+    const header: string[] = [
+      clip(border("─".repeat(innerWidth))),
+      clip(accent(bold(`Plan ready (${this.stepCount} steps)`))),
+    ];
+    if (this.summary) {
+      header.push(clip(muted(this.summary)));
+    }
+    header.push(clip(dim("─".repeat(Math.min(innerWidth, 60)))));
+    if (this.truncated) {
+      header.push(clip(this.theme.fg("warning", "… truncated, see plan.md for full content")));
     }
 
-    push(dim(FOOTER));
-    push(border("─".repeat(innerWidth)));
+    // Body fills everything between header and footer. Pad short plans inside
+    // the body so options stay pinned to the bottom of the panel.
+    let bodyBudget = maxRenderLines - header.length - footer.length;
+    bodyBudget = Math.max(1, bodyBudget);
 
-    // Do not pad with trailing blank lines — that pushed options up and made the
-    // dialog look like it was floating in the middle of the terminal.
-    this.cachedLines =
-      lines.length > maxRenderLines ? lines.slice(0, maxRenderLines) : lines;
+    const needsScroll = planLines.length > bodyBudget;
+    if (needsScroll) {
+      // Steal one body row for the scroll status line.
+      bodyBudget = Math.max(1, bodyBudget - 1);
+    }
+
+    const maxScroll = Math.max(0, planLines.length - bodyBudget);
+    this.scrollOffset = Math.min(this.scrollOffset, maxScroll);
+
+    const body: string[] = [];
+    if (needsScroll) {
+      const start = this.scrollOffset + 1;
+      const end = Math.min(this.scrollOffset + bodyBudget, planLines.length);
+      body.push(
+        clip(dim(`▲ plan ${start}-${end}/${planLines.length} · mouse/PgUp/PgDn`)),
+      );
+    }
+
+    const visiblePlan = planLines.slice(
+      this.scrollOffset,
+      this.scrollOffset + bodyBudget,
+    );
+    for (const line of visiblePlan) {
+      body.push(clip(line));
+    }
+    while (body.length < (needsScroll ? bodyBudget + 1 : bodyBudget)) {
+      body.push("");
+    }
+
+    const lines = [...header, ...body, ...footer];
+
+    // Safety: never clip the sticky footer if we somehow overflowed.
+    if (lines.length > maxRenderLines) {
+      const keepHeader = header.length;
+      const keepFooter = footer.length;
+      const keepBody = Math.max(0, maxRenderLines - keepHeader - keepFooter);
+      this.cachedLines = [
+        ...header,
+        ...body.slice(0, keepBody),
+        ...footer,
+      ].slice(0, maxRenderLines);
+    } else if (lines.length < maxRenderLines) {
+      // Extra slack goes into the body (before footer), never after options.
+      const pad = maxRenderLines - lines.length;
+      this.cachedLines = [
+        ...header,
+        ...body,
+        ...Array.from({ length: pad }, () => ""),
+        ...footer,
+      ];
+    } else {
+      this.cachedLines = lines;
+    }
+
     this.cachedWidth = width;
     return this.cachedLines;
   }

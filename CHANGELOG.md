@@ -1,3 +1,11 @@
+## [2.4.2] - 2026-07-29
+
+### Changed
+- **Near-fullscreen plan ready (92%)**: taller bottom-anchored panel with scrollable plan body and sticky option footer (Cursor / Claude Code style).
+
+### Fixed
+- **Plan-mode `2>&1` false positive**: fd-to-fd redirects no longer trip the file-redirect destructive check, so `ls … 2>&1` / `cat … 2>&1 | head` work in plan mode.
+
 ## [2.4.1] - 2026-07-29
 
 ### Fixed

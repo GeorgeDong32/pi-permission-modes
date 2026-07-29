@@ -33,7 +33,8 @@ const DESTRUCTIVE_PATTERNS: RegExp[] = [
 	/\btruncate\b/i,
 	/\bdd\b/i,
 	/\bshred\b/i,
-	/(^|[^<])>(?!>)/, // single redirect (not >>)
+	// File redirects only — fd-to-fd (2>&1 / >&2) is stripped before matching.
+	/(^|[^<])>(?!>)/,
 	/>>/, // append redirect
 	/\bnpm\s+(install|uninstall|update|ci|link|publish)/i,
 	/\byarn\s+(add|remove|install|publish)/i,
@@ -170,6 +171,15 @@ const AUTO_FALLBACK_OUTSIDE_PATH_PATTERNS: RegExp[] = [
 
 const NESTED_SHELL_PATTERNS: RegExp[] = [/`/, /\$\(/, /\$\{/, /<\(/, />\(/];
 
+/**
+ * Strip fd-to-fd redirects like `2>&1`, `>&2`, `1<&0`.
+ * These do not write files and must not trip the `>` destructive check.
+ * Agents commonly append `2>&1` when exploring in plan mode.
+ */
+export function stripFdToFdRedirects(command: string): string {
+	return command.replace(/(?:\d*)>&\d+/g, " ").replace(/(?:\d*)<&\d+/g, " ")
+}
+
 function isCharEscaped(command: string, index: number): boolean {
 	let backslashes = 0
 	for (let j = index - 1; j >= 0 && command[j] === "\\"; j--) {
@@ -268,8 +278,9 @@ function hasNestedShellExecution(command: string): boolean {
 
 function isSafeSingleCommand(command: string): boolean {
 	if (hasNestedShellExecution(command)) return false
-	const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command))
-	const isSafe = SAFE_PATTERNS.some((p) => p.test(command))
+	const normalized = stripFdToFdRedirects(command)
+	const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(normalized))
+	const isSafe = SAFE_PATTERNS.some((p) => p.test(normalized))
 	return !isDestructive && isSafe
 }
 
@@ -373,8 +384,9 @@ const AUTO_APPROVABLE_EXCLUDE: RegExp[] = [
 
 function isAutoApprovableSingleCommand(command: string): boolean {
 	if (hasNestedShellExecution(command)) return false
-	if (AUTO_APPROVABLE_EXCLUDE.some((p) => p.test(command))) return false
-	return AUTO_APPROVABLE_PATTERNS.some((p) => p.test(command))
+	const normalized = stripFdToFdRedirects(command)
+	if (AUTO_APPROVABLE_EXCLUDE.some((p) => p.test(normalized))) return false
+	return AUTO_APPROVABLE_PATTERNS.some((p) => p.test(normalized))
 }
 
 /**

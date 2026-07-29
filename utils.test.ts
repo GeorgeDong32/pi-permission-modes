@@ -98,6 +98,23 @@ describe("isSafeCommand", () => {
 	it("treats escaped semicolons as part of one command", () => {
 		expect(isSafeCommand("printf foo\\;bar")).toBe(true)
 	});
+
+	it("allows stderr/stdout fd redirects commonly used by agents", () => {
+		expect(isSafeCommand("ls -1 /tmp 2>&1")).toBe(true)
+		expect(isSafeCommand("cat foo.txt 2>&1 | head -60")).toBe(true)
+		expect(
+			isSafeCommand(
+				"ls -la /tmp 2>&1; cat CHANGELOG.md 2>&1 | head -60",
+			),
+		).toBe(true)
+		expect(isSafeCommand("git status >&2")).toBe(true)
+	});
+
+	it("still rejects real file redirects", () => {
+		expect(isSafeCommand("ls > out.txt")).toBe(false)
+		expect(isSafeCommand("cat foo 2> err.txt")).toBe(false)
+		expect(isSafeCommand("echo hi >> out.txt")).toBe(false)
+	});
 });
 
 describe("isAutoFallbackBash", () => {
