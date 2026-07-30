@@ -105,6 +105,7 @@ import {
   loadModelProfiles,
   parseModelId,
   profileExists,
+  resolveEffortForMode,
   resolveModelForMode,
   resolveSkillFilter,
   type ModelProfile,
@@ -112,6 +113,16 @@ import {
 } from "./profiles.ts";
 
 type Mode = PermissionMode;
+
+/** Effort / thinking levels accepted in model-profiles.json. */
+const PROFILE_EFFORT_LEVELS = new Set([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
 
 const MODE_CYCLE: Mode[] = ["ask", "plan", "auto", "bypass"];
 
@@ -641,8 +652,18 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       return;
     }
 
-    if (parsed.thinkingLevel && typeof pi.setThinkingLevel === "function") {
-      pi.setThinkingLevel(parsed.thinkingLevel as any);
+    const effort = resolveEffortForMode(modelProfileConfig, mode);
+    if (!effort) return;
+    if (!PROFILE_EFFORT_LEVELS.has(effort)) {
+      if (ctx.hasUI)
+        ctx.ui.notify(
+          `Unknown effort "${effort}" in profile "${activeProfile}" (expected: ${[...PROFILE_EFFORT_LEVELS].join(", ")})`,
+          "warning",
+        );
+      return;
+    }
+    if (typeof pi.setThinkingLevel === "function") {
+      pi.setThinkingLevel(effort as any);
     }
   }
 

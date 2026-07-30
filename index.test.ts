@@ -827,6 +827,20 @@ describe("permission-modes extension: model profiles", () => {
 		})
 		expect(pi.setModelCalls.length).toBeGreaterThan(0)
 		expect(pi.setModelCalls[0].model).toBe(fakeModel)
+		expect(pi.getThinkingLevel()).toBe("medium")
+	})
+
+	it("applyProfileModelForMode defaults effort to medium when unset", async () => {
+		setupProfile({
+			active: "main",
+			main: { ask: "prov1/askModel" },
+		})
+		pi.flags["model-profile"] = "main"
+		permissionModesExtension(makeFakePiForExtension(pi))
+		await pi.simulateSessionStart("/home/user/project/src", undefined, {
+			find: () => ({ id: "askModel" }),
+		})
+		expect(pi.getThinkingLevel()).toBe("medium")
 	})
 
 	it("applyProfileModelForMode warns (not crashes) when model is not in registry", async () => {
@@ -868,6 +882,82 @@ describe("permission-modes extension: model profiles", () => {
 		expect(pi.setModelCalls.length).toBe(0)
 		expect(notifs.some((n) => /api key|no api/i.test(n))).toBe(true)
 		fakePi.setModel = originalSetModel
+	})
+
+	it("applyProfileModelForMode applies ModeConfig.effort via setThinkingLevel", async () => {
+		setupProfile({
+			active: "main",
+			main: {
+				ask: { model: "prov1/askModel", effort: "high" },
+				plan: { model: "prov1/planModel", effort: "low" },
+				auto: "prov1/autoModel",
+			},
+		})
+		const fakeModels: Record<string, unknown> = {
+			askModel: { id: "askModel" },
+			planModel: { id: "planModel" },
+			autoModel: { id: "autoModel" },
+		}
+		const registry = {
+			find: (_provider: string, model: string) => fakeModels[model],
+		}
+		pi.flags["model-profile"] = "main"
+		permissionModesExtension(makeFakePiForExtension(pi))
+		await pi.simulateSessionStart("/home/user/project/src", undefined, registry)
+		expect(pi.getThinkingLevel()).toBe("high")
+
+		await pi.simulateCommand("plan", "", makeCtx(pi, {
+			cwd: "/home/user/project/src",
+			ui: { notify: () => {}, select: async () => "Block" },
+			modelRegistry: registry,
+		}))
+		expect(pi.getThinkingLevel()).toBe("low")
+	})
+
+	it("applyProfileModelForMode prefers ModeConfig.effort over model :suffix", async () => {
+		setupProfile({
+			active: "main",
+			main: {
+				ask: { model: "prov1/askModel:medium", effort: "high" },
+			},
+		})
+		pi.flags["model-profile"] = "main"
+		permissionModesExtension(makeFakePiForExtension(pi))
+		await pi.simulateSessionStart("/home/user/project/src", undefined, {
+			find: () => ({ id: "askModel" }),
+		})
+		expect(pi.getThinkingLevel()).toBe("high")
+	})
+
+	it("applyProfileModelForMode applies :suffix effort when ModeConfig.effort is absent", async () => {
+		setupProfile({
+			active: "main",
+			main: { ask: "prov1/askModel:xhigh" },
+		})
+		pi.flags["model-profile"] = "main"
+		permissionModesExtension(makeFakePiForExtension(pi))
+		await pi.simulateSessionStart("/home/user/project/src", undefined, {
+			find: () => ({ id: "askModel" }),
+		})
+		expect(pi.getThinkingLevel()).toBe("xhigh")
+	})
+
+	it("applyProfileModelForMode warns on unknown effort and skips setThinkingLevel", async () => {
+		setupProfile({
+			active: "main",
+			main: { ask: { model: "prov1/askModel", effort: "ultra" } },
+		})
+		pi.flags["model-profile"] = "main"
+		const notifs: string[] = []
+		permissionModesExtension(makeFakePiForExtension(pi))
+		await pi.simulateSessionStart("/home/user/project/src", {
+			notify: (m: string) => notifs.push(m),
+			select: async () => "Block",
+		}, {
+			find: () => ({ id: "askModel" }),
+		})
+		expect(pi.getThinkingLevel()).toBe("off")
+		expect(notifs.some((n) => /unknown effort/i.test(n))).toBe(true)
 	})
 
 	it("setMode re-applies the model when profile is active", async () => {

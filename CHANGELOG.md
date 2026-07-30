@@ -1,3 +1,8 @@
+## [2.5.0] - 2026-07-30
+
+### Added
+- **Profile effort**: `ModeConfig.effort` on each mode entry in `model-profiles.json`. Switching modes applies model **and** thinking level (`off|minimal|low|medium|high|xhigh`). Explicit `effort` wins over a `:suffix` on the model string; bare `"provider/model:high"` still works. If neither is set, defaults to **`medium`**.
+
 ## [2.4.2] - 2026-07-29
 
 ### Changed
@@ -12,6 +17,7 @@
 - **Plan ready dialog floating mid-screen**: stop padding the dialog to the full terminal height (which pushed options upward). Use a bottom-anchored overlay (`anchor: bottom-center`, `maxHeight: 50%`) with options fixed at the bottom of the panel.
 - **Stay in plan mode needing two dismisses**: after Stay/Esc/Refine, sync the plan hash and suppress `agent_end` re-offer for the cooldown window so the dialog does not immediately reopen.
 
+[2.5.0]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.4.2...v2.5.0
 [2.4.2]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/GeorgeDong32/pi-permission-modes/compare/v2.4.0...v2.4.1
 

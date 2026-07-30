@@ -20,6 +20,7 @@ import {
 	loadModelProfiles,
 	parseModelId,
 	profileExists,
+	resolveEffortForMode,
 	resolveModeConfig,
 	resolveModelForMode,
 	resolveSkillFilter,
@@ -124,7 +125,65 @@ describe("resolveModelForMode", () => {
 		expect(resolveModelForMode(config, "plan")).toBe("p/plan")
 		expect(resolveModelForMode(config, "auto")).toBe("au/auto")
 	})
+})
 
+// ---- resolveEffortForMode ---------------------------------------------
+
+describe("resolveEffortForMode", () => {
+	it("defaults to medium when no effort is configured", () => {
+		expect(resolveEffortForMode({}, "ask")).toBe("medium")
+		expect(
+			resolveEffortForMode({ active: "p", p: { ask: "a/b" } }, "ask"),
+		).toBe("medium")
+	})
+
+	it("reads ModeConfig.effort", () => {
+		const config: ModelProfilesConfig = {
+			active: "p",
+			p: {
+				ask: { model: "a/b", effort: "high" },
+				bypass: { model: "a/b", effort: "medium" },
+			},
+		}
+		expect(resolveEffortForMode(config, "ask")).toBe("high")
+		expect(resolveEffortForMode(config, "bypass")).toBe("medium")
+	})
+
+	it("parses :suffix from bare model string", () => {
+		const config: ModelProfilesConfig = {
+			active: "p",
+			p: { plan: "prov/model:xhigh" },
+		}
+		expect(resolveEffortForMode(config, "plan")).toBe("xhigh")
+	})
+
+	it("prefers ModeConfig.effort over model :suffix", () => {
+		const config: ModelProfilesConfig = {
+			active: "p",
+			p: { ask: { model: "prov/model:low", effort: "high" } },
+		}
+		expect(resolveEffortForMode(config, "ask")).toBe("high")
+	})
+
+	it("falls back to default profile", () => {
+		const config: ModelProfilesConfig = {
+			active: "pro",
+			pro: { plan: "x/y" },
+			default: { ask: { model: "a/b", effort: "minimal" } },
+		}
+		expect(resolveEffortForMode(config, "ask")).toBe("minimal")
+	})
+
+	it("parses :suffix from ModeConfig.model when effort field is absent", () => {
+		const config: ModelProfilesConfig = {
+			active: "p",
+			p: { auto: { model: "prov/model:off" } },
+		}
+		expect(resolveEffortForMode(config, "auto")).toBe("off")
+	})
+})
+
+describe("resolveModelForMode (ModeConfig object entries)", () => {
 	it("returns undefined when active profile is missing AND no default", () => {
 		const config: ModelProfilesConfig = { active: "missing" }
 		expect(resolveModelForMode(config, "ask")).toBeUndefined()

@@ -61,25 +61,29 @@ When a tool call would prompt, you can choose **Allow always (this project)** or
 
 ## Model profiles (v1.1.1)
 
-Define named profiles in `~/.pi/agent/model-profiles.json` mapping each mode to a model ID:
+Define named profiles in `~/.pi/agent/model-profiles.json` mapping each mode to a **model + effort** pair. Each mode entry can be a bare model string, or a `ModeConfig` object:
 
 ```json
 {
   "active": "default",
   "default": {
-    "ask":  "anthropic/claude-opus-4-5",
-    "plan": "anthropic/claude-opus-4-5",
-    "auto": "anthropic/claude-haiku-4-5"
+    "ask":  { "model": "anthropic/claude-opus-4-5", "effort": "high" },
+    "plan": { "model": "anthropic/claude-opus-4-5", "effort": "xhigh" },
+    "auto": { "model": "anthropic/claude-haiku-4-5", "effort": "low" },
+    "bypass": { "model": "anthropic/claude-haiku-4-5", "effort": "medium" }
   },
   "fast": {
-    "ask":  "anthropic/claude-haiku-4-5",
-    "plan": "anthropic/claude-haiku-4-5",
-    "auto": "anthropic/claude-haiku-4-5"
+    "ask":  "anthropic/claude-haiku-4-5:low",
+    "plan": "anthropic/claude-haiku-4-5:low",
+    "auto": "anthropic/claude-haiku-4-5:off"
   }
 }
 ```
 
-A model ID is `"provider/model"` or `"provider/model:thinking"` (the `:thinking` suffix sets the thinking level after the switch — e.g. `anthropic/claude-sonnet-4-5:high`). When the mode changes, the extension auto-switches the model via `pi.setModel()`. The footer shows `profile:<name> · model/thinking` when a profile is active.
+- **Model ID**: `"provider/model"`, or `"provider/model:effort"` (the `:effort` suffix sets thinking after the switch).
+- **`ModeConfig.effort`**: explicit field (`off` | `minimal` | `low` | `medium` | `high` | `xhigh`). Wins over a `:suffix` on the same entry. If neither is set, defaults to **`medium`**.
+- When the mode changes, the extension calls `pi.setModel()` then `pi.setThinkingLevel()`. Unknown levels are skipped with a notify warning.
+- The footer shows `profile:<name> · model/thinking` when a profile is active.
 
 If the file doesn't exist on first install, the extension creates it for you (pre-filled with the user's default model from `~/.pi/agent/settings.json` when available).
 

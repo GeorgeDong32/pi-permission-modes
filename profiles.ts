@@ -1,9 +1,10 @@
 /**
  * Pure helpers for the model-profile config.
  *
- * Profiles map each mode (ask / plan / auto) to a model ID — either
- * `"provider/model"` or `"provider/model:thinking"` (with an optional
- * `:thinking` suffix that sets the thinking level after the switch).
+ * Profiles map each mode (ask / plan / auto / bypass) to a model ID — either
+ * `"provider/model"` or `"provider/model:effort"` (with an optional
+ * `:effort` suffix that sets the thinking level after the switch) — or to a
+ * ModeConfig object with explicit `model` / `effort` / `skills` / `tools`.
  *
  * The config file lives at `~/.pi/agent/model-profiles.json` — a deliberately
  * distinct name from pi's own `models.json` (which is used for custom
@@ -17,9 +18,15 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
-/** Per-mode configuration object with optional model, skill, and tool filters. */
+/** Per-mode configuration object with optional model, effort, skill, and tool filters. */
 export interface ModeConfig {
 	model?: string
+	/**
+	 * Thinking / effort level applied after the model switch
+	 * (e.g. `"high"`, `"medium"`, `"off"`). Takes precedence over a
+	 * `:suffix` on `model` (e.g. `"provider/model:high"`).
+	 */
+	effort?: string
 	/** Skill name allowlist. ["*"] = all loaded skills. A specific list = only those. */
 	skills?: string[]
 	/** Tool name allowlist. ["*"] = all active tools. A specific list = only those. */
@@ -198,6 +205,50 @@ export function resolveModelForMode(
 	return undefined
 }
 
+/** Default thinking level when a profile mode has no explicit effort / `:suffix`. */
+export const DEFAULT_PROFILE_EFFORT = "medium"
+
+/**
+ * Resolve the effort / thinking level for a mode from the active profile.
+ *
+ * Priority:
+ *   1. Explicit `ModeConfig.effort` on the resolved mode entry
+ *   2. `:suffix` on the model string (e.g. `"provider/model:high"`)
+ *   3. {@link DEFAULT_PROFILE_EFFORT} (`"medium"`)
+ *
+ * Falls back through the `default` profile the same way as
+ * {@link resolveModelForMode}.
+ */
+export function resolveEffortForMode(
+	config: ModelProfilesConfig,
+	mode: "ask" | "plan" | "auto" | "bypass",
+): string {
+	const profileName = config.active || "default"
+	const profile = config[profileName] as ModelProfile | undefined
+	const fromActive = effortFromProfileEntry(profile?.[mode])
+	if (fromActive) return fromActive
+
+	if (profileName !== "default") {
+		const def = config["default"] as ModelProfile | undefined
+		const fromDefault = effortFromProfileEntry(def?.[mode])
+		if (fromDefault) return fromDefault
+	}
+	return DEFAULT_PROFILE_EFFORT
+}
+
+function effortFromProfileEntry(
+	entry: string | ModeConfig | undefined,
+): string | undefined {
+	if (entry === undefined) return undefined
+	if (typeof entry === "string") {
+		return parseModelId(entry)?.thinkingLevel
+	}
+	const trimmed = entry.effort?.trim()
+	if (trimmed) return trimmed
+	if (entry.model) return parseModelId(entry.model)?.thinkingLevel
+	return undefined
+}
+
 /**
  * Get the active profile name, defaulting to `"default"`.
  */
@@ -226,6 +277,7 @@ function normalizeModeEntry(
 	if (typeof entry === "string") return { model: entry, skills: ["*"], tools: ["*"] }
 	return {
 		model: entry.model,
+		effort: entry.effort,
 		skills: entry.skills ?? ["*"],
 		tools: entry.tools ?? ["*"],
 	}
