@@ -480,8 +480,8 @@ function buildClassifierCompletionOptions(
 ): Record<string, unknown> {
 	const options: Record<string, unknown> = {
 		...base,
-		temperature: 0,
 	}
+	if (model.api !== "openai-codex-responses") options.temperature = 0
 
 	if (stage !== "tool") return options
 

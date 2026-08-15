@@ -171,12 +171,12 @@ describe("classifyToolCall", () => {
 		vi.restoreAllMocks()
 	})
 
-	function makeRegistry(): ClassifierRegistry {
+	function makeRegistry(api = "anthropic-messages"): ClassifierRegistry {
 		return {
 			find: () =>
 				({
 					id: "test-model",
-					api: "anthropic-messages",
+					api,
 					baseUrl: "https://api.example.com",
 					provider: "test",
 				}) as any,
@@ -271,6 +271,28 @@ describe("classifyToolCall", () => {
 		expect(context.messages[0]?.content[0].text).not.toContain(
 			"Reply with one JSON object only",
 		)
+	})
+
+	it("omits temperature for the OpenAI Codex API", async () => {
+		completeSimpleMock.mockResolvedValue(
+			makeAssistantResponse('{"shouldBlock":false,"reason":"fine"}'),
+		)
+
+		await classifyToolCall({
+			modelRef: "test/test-model",
+			session: session(),
+			pendingTool: { name: "bash", input: { command: "npm test" } },
+			registry: makeRegistry("openai-codex-responses"),
+			timeoutMs: 5000,
+			stage: "single",
+		})
+
+		const [, , options] = completeSimpleMock.mock.calls[0]!
+		expect(options).not.toHaveProperty("temperature")
+		expect(options).toMatchObject({
+			apiKey: "test-key",
+			maxTokens: 512,
+		})
 	})
 
 	it("honors @single suffix on model ref over config stage", async () => {
