@@ -1,17 +1,21 @@
-/**
- * CC-style auto-mode classifier client for pi.
- * Uses pi-ai completeSimple + CC transcript / system prompt assembly.
+/** CC-style auto-mode classifier client for pi.
+ *
+ * Completion goes through the host `ModelRegistry.complete()` (plan2 B2):
+ * auth resolution — including the provider baseUrl merge — happens inside
+ * ModelRuntime.prepareRequest, so this client no longer hand-rolls auth or
+ * imports the deprecated pi-ai/compat entrypoint (its deletion would have
+ * broken extension loading outright).
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs"
 import { join } from "node:path"
-import {
-	completeSimple,
-	type Api,
-	type AssistantMessage,
-	type Context,
-	type Model,
-} from "@earendil-works/pi-ai/compat"
+import type { ModelRegistry } from "@earendil-works/pi-coding-agent"
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	Model,
+} from "@earendil-works/pi-ai"
 import {
 	buildClassifierSystemPrompt,
 	type AutoModeRules,
@@ -40,18 +44,24 @@ export type ClassifierVerdict = {
 	unavailable?: boolean
 }
 
-export type ResolvedAuth =
-	| {
-			ok: true
-			apiKey?: string
-			headers?: Record<string, string>
-			env?: Record<string, string>
-	  }
-	| { ok: false; error: string }
+/** Real auth shape from the host registry (ok branch carries baseUrl). */
+export type ResolvedAuth = Awaited<
+	ReturnType<ModelRegistry["getApiKeyAndHeaders"]>
+>
+
+/** Options the host registry accepts for complete() (per-API option union). */
+export type ClassifierCompleteOptions = NonNullable<
+	Parameters<ModelRegistry["complete"]>[2]
+>
 
 export interface ClassifierRegistry {
 	find(provider: string, modelId: string): Model<Api> | undefined
 	getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedAuth>
+	complete(
+		model: Model<Api>,
+		context: Context,
+		options?: ClassifierCompleteOptions,
+	): Promise<AssistantMessage>
 }
 
 export type ClassifierSessionContext = {
@@ -481,15 +491,19 @@ function buildClassifierCompletionOptions(
 	model: Model<Api>,
 	stage: ClassifierStage,
 	base: {
-		apiKey?: string
-		headers?: Record<string, string>
-		env?: Record<string, string>
 		signal: AbortSignal
 		maxTokens: number
+		/** Hard per-attempt bound: the visible retry layer lives in index.ts
+		 *  (MAX_CLASSIFIER_FAILURES), so SDK-level retries are disabled here —
+		 *  total classifier wait ≤ timeoutMs × attempts. */
+		timeoutMs: number
 	},
 ): Record<string, unknown> {
 	const options: Record<string, unknown> = {
-		...base,
+		signal: base.signal,
+		maxTokens: base.maxTokens,
+		timeoutMs: base.timeoutMs,
+		maxRetries: 0,
 		temperature: 0,
 	}
 
@@ -523,8 +537,8 @@ function buildClassifierCompletionOptions(
 }
 
 async function runClassifierCompletion(
+	registry: ClassifierRegistry,
 	model: Model<Api>,
-	auth: Extract<ResolvedAuth, { ok: true }>,
 	systemPrompt: string,
 	userPrompt: string,
 	signal: AbortSignal,
@@ -552,16 +566,16 @@ async function runClassifierCompletion(
 		...(stage === "tool" ? { tools: [classifierResultTool] } : {}),
 	}
 
-	const response = await completeSimple(
+	// Auth (apiKey/headers/env AND the provider baseUrl merge) is resolved
+	// inside registry.complete via ModelRuntime.prepareRequest.
+	const response = await registry.complete(
 		model,
 		context,
 		buildClassifierCompletionOptions(model, stage, {
-			apiKey: auth.apiKey,
-			headers: auth.headers,
-			env: auth.env,
 			signal,
+			timeoutMs,
 			maxTokens: opts?.maxTokens ?? (stage === "tool" ? 1024 : 512),
-		}) as Parameters<typeof completeSimple>[2],
+		}) as ClassifierCompleteOptions,
 	)
 
 	if (response.stopReason === "aborted") {
@@ -593,8 +607,8 @@ function parseClassifierResponse(
 }
 
 async function classifyWithStagePipeline(opts: {
+	registry: ClassifierRegistry
 	model: Model<Api>
-	auth: Extract<ResolvedAuth, { ok: true }>
 	systemPrompt: string
 	userPrompt: string
 	signal: AbortSignal
@@ -607,8 +621,8 @@ async function classifyWithStagePipeline(opts: {
 
 	if (stage === "tool") {
 		const message = await runClassifierCompletion(
+			opts.registry,
 			opts.model,
-			opts.auth,
 			opts.systemPrompt,
 			opts.userPrompt,
 			opts.signal,
@@ -632,8 +646,8 @@ async function classifyWithStagePipeline(opts: {
 
 	if (stage === "single") {
 		const message = await runClassifierCompletion(
+			opts.registry,
 			opts.model,
-			opts.auth,
 			opts.systemPrompt,
 			opts.userPrompt,
 			opts.signal,
@@ -655,8 +669,8 @@ async function classifyWithStagePipeline(opts: {
 		suffix: string,
 	): Promise<ClassifierVerdict> => {
 		const message = await runClassifierCompletion(
+			opts.registry,
 			opts.model,
-			opts.auth,
 			xmlSystemPrompt,
 			wrappedUserPrompt,
 			opts.signal,
@@ -782,6 +796,8 @@ export async function classifyToolCall(opts: {
 	}
 
 	try {
+		// Pre-flight: surface unconfigured auth with the same clean error as
+		// before. The credentials themselves are applied by registry.complete.
 		const auth = await opts.registry.getApiKeyAndHeaders(model)
 		if (!auth.ok) throw new Error(auth.error)
 
@@ -812,8 +828,8 @@ export async function classifyToolCall(opts: {
 		}
 
 		const verdict = await classifyWithStagePipeline({
+			registry: opts.registry,
 			model,
-			auth,
 			systemPrompt,
 			userPrompt,
 			signal: controller.signal,

@@ -544,13 +544,16 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     const reviewHint = describeTier3Review(tool, input, ctx.cwd);
 
     if (classifierConfig.enabled) {
+      // Single visible retry layer (plan2 B2): the classifier call disables
+      // SDK-level retries (maxRetries: 0) and enforces timeoutMs per attempt,
+      // so the worst-case wait here is timeoutMs × MAX_CLASSIFIER_FAILURES.
       for (let attempt = 1; attempt <= MAX_CLASSIFIER_FAILURES; attempt++) {
         try {
           const verdict = await classifyToolCall({
             modelRef: classifierConfig.model,
             session: collectClassifierSessionContext(ctx, reviewHint),
             pendingTool: { name: tool, input },
-            registry: ctx.modelRegistry as any,
+            registry: ctx.modelRegistry,
             autoMode: autoModeConfig,
             timeoutMs: classifierConfig.timeoutMs,
             jsonlTranscript: classifierConfig.jsonlTranscript,

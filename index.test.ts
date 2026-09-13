@@ -986,6 +986,58 @@ describe("permission-modes extension: tool_call gate", () => {
 				"temporarily unavailable",
 			)
 		})
+
+		it("classifier retry loop is bounded to attempts × timeoutMs (plan2 B2)", async () => {
+			writeFileSync(
+				join(configTmp, "permission-modes.json"),
+				JSON.stringify({
+					classifier: {
+						enabled: true,
+						model: "test/test-model",
+						timeoutMs: 40,
+						failClosed: true,
+					},
+				}),
+			)
+			const completeCalls: Array<{ maxRetries?: number; timeoutMs?: number }> = []
+			const registry = {
+				find: () =>
+					({
+						id: "test-model",
+						api: "anthropic-messages",
+						baseUrl: "https://api.example.com",
+						provider: "test",
+					}) as never,
+				getApiKeyAndHeaders: async () => ({ ok: true }),
+				complete: (_model: unknown, _context: unknown, options: { signal?: AbortSignal; maxRetries?: number; timeoutMs?: number }) => {
+					completeCalls.push(options)
+					return new Promise((_resolve, reject) => {
+						options?.signal?.addEventListener(
+							"abort",
+							() => reject(new Error("aborted")),
+							{ once: true },
+						)
+					})
+				},
+			}
+			await switchMode("auto")
+			const started = Date.now()
+			const result = await pi.simulateToolCall(
+				"bash",
+				{ command: "npm install lodash" },
+				makeCtx(pi, {
+					cwd: realProjectRoot,
+					modelRegistry: registry as unknown as { find: (p: string, m: string) => unknown },
+				}),
+			)
+			const elapsed = Date.now() - started
+			// single visible layer: exactly MAX_CLASSIFIER_FAILURES attempts,
+			// each capped at timeoutMs — no silent SDK retry stacking
+			expect(completeCalls.length).toBe(3)
+			expect(completeCalls[0]).toMatchObject({ maxRetries: 0, timeoutMs: 40 })
+			expect(elapsed).toBeLessThan(40 * 3 * 5)
+			expect(result).toMatchObject({ block: true })
+		})
 	})
 
 	describe("permission rules", () => {
