@@ -67,6 +67,13 @@ describe("readBranchMessages", () => {
 		expect(messages[2]?.toolName).toBe("bash")
 	})
 
+	it("tail parameter is equivalent to slicing the full materialization (A1a)", () => {
+		const full = readBranchMessages(sessionManager)
+		expect(readBranchMessages(sessionManager, 2)).toEqual(full.slice(-2))
+		expect(readBranchMessages(sessionManager, 0)).toEqual([])
+		expect(readBranchMessages(sessionManager, 99)).toEqual(full.slice(-99))
+	})
+
 	it("drops malformed message entries instead of throwing", () => {
 		const sm = {
 			getBranch: () => [

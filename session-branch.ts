@@ -57,16 +57,24 @@ export function readBranchEntries(sessionManager: unknown): BranchEntry[] {
 	}
 }
 
-/** Unwrapped agent messages (message entries only), in branch order. */
+/** Unwrapped agent messages (message entries only), in branch order.
+ *  `tail` limits materialization to the last N messages (plan2 A1a: the only
+ *  consumer needs the trailing 12 for the injection scan, but the branch can
+ *  hold the whole session) — `readBranchMessages(sm, n)` is exactly
+ *  `readBranchMessages(sm).slice(-n)`. */
 export function readBranchMessages(
 	sessionManager: unknown,
+	tail?: number,
 ): BranchAgentMessage[] {
 	const messages: BranchAgentMessage[] = []
+	if (tail !== undefined && tail <= 0) return messages
+	const keep = tail ?? Number.POSITIVE_INFINITY
 	for (const entry of readBranchEntries(sessionManager)) {
 		if (entry?.type !== "message") continue
 		const msg = (entry as BranchMessageEntry).message
 		if (msg && (msg.role === "user" || msg.role === "assistant" || msg.role === "toolResult")) {
 			messages.push(msg)
+			if (messages.length > keep) messages.shift()
 		}
 	}
 	return messages

@@ -2000,7 +2000,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       try {
         // Real SessionEntry shape comes unwrapped from the port; the legacy
         // flat `ctx.messages` fallback predates typed access (plan B1).
-        const messages = readBranchMessages(ctx.sessionManager);
+        // plan2 A1a: only the trailing 12 messages feed the injection scan —
+        // materialize just those instead of the whole branch.
+        const messages = readBranchMessages(ctx.sessionManager, 12);
         const signal = scanBranchForInjectionSignals(
           messages.length > 0 ? messages : (((ctx as any).messages ?? []) as never[]),
         );
