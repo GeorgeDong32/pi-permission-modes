@@ -45,9 +45,7 @@ describe("mode-inherit", () => {
 		expect(applyInheritedModeForChild()).toBeUndefined();
 
 		process.env[SUBAGENT_CHILD_ENV] = "1";
-		expect(applyInheritedModeForChild({ flagSet: true, currentMode: "ask" })).toBe(
-			"bypass",
-		);
+		expect(applyInheritedModeForChild()).toBe("bypass");
 		expect(applyInheritedModeForChild()).toBe("bypass");
 	});
 });

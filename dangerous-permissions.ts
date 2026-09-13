@@ -124,13 +124,6 @@ export function isDangerousBashPermission(
 	return false
 }
 
-export function isDangerousClassifierPermission(
-	toolName: string,
-	ruleContent: string | undefined,
-): boolean {
-	return isDangerousBashPermission(toolName, ruleContent)
-}
-
 export type StripDangerousResult = {
 	active: PermissionRule[]
 	stashed: PermissionRule[]
@@ -150,7 +143,7 @@ export function stripDangerousPermissionRules(
 	for (const rule of rules) {
 		if (
 			rule.behavior === "allow" &&
-			isDangerousClassifierPermission(
+			isDangerousBashPermission(
 				rule.ruleValue.toolName,
 				rule.ruleValue.ruleContent,
 			)

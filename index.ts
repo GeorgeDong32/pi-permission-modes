@@ -442,16 +442,6 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     return applyApprovalDecision(ctx, tool, input, decision, { category });
   }
 
-  async function promptAutoTier3(
-    ctx: ExtensionContext,
-    tool: string,
-    input: Record<string, unknown>,
-    reason: string,
-    category: string,
-  ): Promise<Block> {
-    return promptWithPermissionOptions(ctx, tool, input, reason, category);
-  }
-
   function classifierErrorMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
   }
@@ -565,7 +555,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
           if (!verdict.allow) {
             classifierDenialState = recordClassifierDenial(classifierDenialState);
             if (shouldFallbackToPrompting(classifierDenialState)) {
-              return promptAutoTier3(
+              return promptWithPermissionOptions(
                 ctx,
                 tool,
                 input,
@@ -603,7 +593,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
     const local = resolveLocalAutoTier3(tool, input, riskInput, ctx.cwd);
     if (!local.allow) {
-      return promptAutoTier3(ctx, tool, input, local.reason, local.category);
+      return promptWithPermissionOptions(ctx, tool, input, local.reason, local.category);
     }
     classifierDenialState = recordClassifierSuccess(classifierDenialState);
     return finishAutoTier3Allow(ctx, tool, input);
@@ -833,7 +823,8 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       return;
     }
     if (typeof pi.setThinkingLevel === "function") {
-      pi.setThinkingLevel(effort as any);
+      // membership in PROFILE_EFFORT_LEVELS checked just above
+      pi.setThinkingLevel(effort as ReturnType<ExtensionAPI["getThinkingLevel"]>);
     }
   }
 
@@ -873,21 +864,18 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         const cwd = shortenPath(ctx.cwd);
         const cwdText = gitBranch ? `${cwd} (${gitBranch})` : cwd;
 
-        const ctxUsage = (ctx as any).getContextUsage?.();
+        const ctxUsage = ctx.getContextUsage?.();
         let ctxStr = "";
         if (ctxUsage && ctxUsage.tokens != null && ctxUsage.percent != null) {
           const fmtK = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}k`;
           ctxStr = `${fmtK(ctxUsage.tokens)}/${fmtK(ctxUsage.contextWindow)} ${ctxUsage.percent.toFixed(1)}%`;
         }
 
-        const md = (ctx as any).model;
+        const md = ctx.model;
         let modelStr = "";
         if (md) {
           modelStr = md.name ? String(md.name) : String(md.id ?? "");
-          const thinking =
-            typeof (pi as any).getThinkingLevel === "function"
-              ? (pi as any).getThinkingLevel()
-              : undefined;
+          const thinking = pi.getThinkingLevel();
           if (thinking) modelStr += ` • ${thinking}`;
         }
         if (activeProfile) {
@@ -998,7 +986,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     if (s.cacheRead) parts.push(`R${formatCount(s.cacheRead)}`);
     if (lastTps > 0) parts.push(`⚡${Math.round(lastTps)} tok/s`);
     parts.push(`$${s.cost.toFixed(3)}`);
-    const usage = (ctx as any).getContextUsage?.();
+    const usage = ctx.getContextUsage?.();
     if (usage && usage.percent != null) {
       parts.push(`${Math.round(usage.percent)}% ctx`);
     }
@@ -1067,7 +1055,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       return "allow";
     }
     if (verdict.behavior === "ask") {
-      return promptAutoTier3(
+      return promptWithPermissionOptions(
         ctx,
         tool,
         input,
@@ -1547,14 +1535,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     "xhigh",
   ] as const;
   function cycleThinkingLevel(ctx: ExtensionContext): void {
-    const get = (): string =>
-      typeof (pi as any).getThinkingLevel === "function"
-        ? (pi as any).getThinkingLevel()
-        : "off";
-    const setLevel = (pi as any).setThinkingLevel as
-      | ((l: string) => void)
-      | undefined;
-    if (typeof setLevel !== "function") return;
+    const get = (): string => pi.getThinkingLevel();
+    const setLevel = (l: ReturnType<ExtensionAPI["getThinkingLevel"]>) =>
+      pi.setThinkingLevel(l);
     const cur = get();
     let i = THINKING_LEVELS.indexOf(cur as (typeof THINKING_LEVELS)[number]);
     if (i < 0) i = 0;
@@ -1733,7 +1716,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       } else if (currentMode === "auto") {
         for (const { command } of embeddedCommands) {
           if (commandReferencesSensitivePath(command)) {
-            return promptAutoTier3(
+            return promptWithPermissionOptions(
               ctx,
               tool,
               input,
@@ -1743,7 +1726,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
           }
           const tiers = classifyBashTiers(command);
           if (!tiers.safe && !tiers.autoApprovable) {
-            return promptAutoTier3(
+            return promptWithPermissionOptions(
               ctx,
               tool,
               input,
@@ -1804,7 +1787,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       if (tool === "read" || tool === "grep" || tool === "find" || tool === "ls") {
         const pathStr = String(input.path ?? "");
         if (pathStr && isSensitivePath(pathStr, ctx.cwd)) {
-          return promptAutoTier3(
+          return promptWithPermissionOptions(
             ctx,
             tool,
             input,
@@ -1818,7 +1801,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       if (tool === "edit" || tool === "write") {
         const pathStr = String(input.path ?? "");
         if (pathStr && isSensitivePath(pathStr, ctx.cwd)) {
-          return promptAutoTier3(
+          return promptWithPermissionOptions(
             ctx,
             tool,
             input,
@@ -1834,7 +1817,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       if (tool === "bash" || tool === "powershell") {
         const cmd = String(input.command ?? "");
         if (cmd && commandReferencesSensitivePath(cmd)) {
-          return promptAutoTier3(
+          return promptWithPermissionOptions(
             ctx,
             tool,
             input,
@@ -1862,7 +1845,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         // Tier 1.5b: autoMode.soft_deny forces a prompt.
         if (cmd && autoModeConfig?.soft_deny?.length) {
           if (autoModeConfig.soft_deny.some((p) => matchAutoModePattern(cmd, p))) {
-            return promptAutoTier3(ctx, tool, input, "matched autoMode.soft_deny", "auto-deny");
+            return promptWithPermissionOptions(ctx, tool, input, "matched autoMode.soft_deny", "auto-deny");
           }
         }
         // Tier 2: common dev workflow commands auto-approve without classifier.
@@ -2047,16 +2030,18 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("context", async (event) => {
-    const msgs = event.messages as any[];
+    const msgs = event.messages;
     let lastIdx = -1;
     for (let i = 0; i < msgs.length; i++) {
-      if (msgs[i]?.customType === "modes-context") lastIdx = i;
+      const custom = msgs[i] as { customType?: string };
+      if (custom?.customType === "modes-context") lastIdx = i;
     }
     if (lastIdx === -1) return undefined;
     return {
-      messages: msgs.filter(
-        (m, i) => m?.customType !== "modes-context" || i === lastIdx,
-      ),
+      messages: msgs.filter((m, i) => {
+        const custom = m as { customType?: string };
+        return custom?.customType !== "modes-context" || i === lastIdx;
+      }),
     };
   });
 
@@ -2128,9 +2113,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       planContent ? extractTodoItems(planContent) : [],
     );
 
-    const lastAssistant = [...(event.messages as any[])]
-      .reverse()
-      .find(isAssistant);
+    const lastAssistant = [...event.messages].reverse().find(isAssistant);
     const assistantText = lastAssistant ? getText(lastAssistant) : "";
     const assistantPlan = assistantText
       ? filterSubstantivePlanItems(extractTodoItems(assistantText))

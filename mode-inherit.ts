@@ -47,10 +47,7 @@ export function resolveInheritedPermissionMode(): InheritableMode | undefined {
  * present (overrides flag + session restore). Parent bypass must mean child
  * bypass — otherwise review fan-out keeps prompting on the parent UI.
  */
-export function applyInheritedModeForChild(_opts?: {
-	flagSet?: boolean;
-	currentMode?: string;
-}): InheritableMode | undefined {
+export function applyInheritedModeForChild(): InheritableMode | undefined {
 	if (!isSubagentChildProcess()) return undefined;
 	return resolveInheritedPermissionMode();
 }
