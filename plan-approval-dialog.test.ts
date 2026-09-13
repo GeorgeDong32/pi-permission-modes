@@ -33,7 +33,7 @@ function makeMockTui(rows: number, columns = 80): TUI {
       write: () => {},
     },
     requestRender: () => {},
-  } as TUI;
+  } as unknown as TUI;
 }
 
 describe("plan-approval-dialog layout helpers", () => {

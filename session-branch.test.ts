@@ -8,34 +8,23 @@ import {
 	readSessionId,
 	type BranchEntry,
 } from "./session-branch.ts"
+import {
+	assistantToolCallMsg,
+	customMsg,
+	msg,
+} from "./test-fixtures.ts"
 
 // Real SessionEntry shapes from pi 0.80+ typings (plan B1 / C2): messages are
 // wrapped as {type:"message", message:{role:"user"|"assistant"|"toolResult"}}.
-function msg(
-	role: "user" | "assistant" | "toolResult",
-	content: unknown,
-	extra: Record<string, unknown> = {},
-): BranchEntry {
-	return { type: "message", id: `e-${role}`, message: { role, content, ...extra } }
-}
-
 const branch: BranchEntry[] = [
 	msg("user", "list the files"),
-	{
-		type: "message",
-		id: "e-a1",
-		message: {
-			role: "assistant",
-			content: [{ type: "toolCall", name: "bash", arguments: { command: "ls" } }],
-			usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
-		},
-	},
+	assistantToolCallMsg("bash", { command: "ls" }),
 	msg("toolResult", [{ type: "text", text: "file_a file_b" }], {
 		toolName: "bash",
 		toolCallId: "c1",
 	}),
-	{ type: "custom", customType: "modes", data: { currentMode: "auto" } },
-	{ type: "thinkingLevelChange", thinkingLevel: "high" },
+	customMsg("modes", { currentMode: "auto" }),
+	{ type: "thinkingLevelChange", thinkingLevel: "high" } as BranchEntry,
 ]
 
 const sessionManager = {

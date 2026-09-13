@@ -18,3 +18,5 @@ jobs:
         run: npm install --ignore-scripts --no-audit --no-fund
       - name: Run tests
         run: npm test
+      - name: Typecheck
+        run: npm run typecheck

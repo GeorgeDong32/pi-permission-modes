@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed (tests/tooling only)
+- **Test infrastructure (plan2 C1)**: the fake pi in `index.test.ts` now implements the full `ExtensionAPI` surface and is passed to the extension factory through a cast-free `satisfies ExtensionAPI` compile contract — a member the extension starts using that the fake lacks now fails `npm run typecheck` instead of silently being `undefined` (the fake previously lacked `getAllTools`). The fake gained `getAllTools()` backed by a test-visible `allTools` list. Shared `SessionEntry` fixtures moved to `test-fixtures.ts` (`msg`/`assistantToolCallMsg`/`toolResultMsg`/`customMsg`) — the three remaining inline session-shape literals (injection cases, session-restore case, branch-stats property generator) now build from the one factory.
+- Unknown tools WITHOUT command-shaped fields are now pinned by characterization tests (ask/plan silent passthrough, auto tier-3 unknown-tool prompt, classifier whole-JSON projection, permission-rule passthrough) — adjudicated intentional behavior (2026-09-13); the B1 embedded-command gate must not widen onto them.
+- New `typecheck` script (`tsc --noEmit`) + CI step. Three latent source type errors surfaced and were fixed with zero runtime delta (`details: undefined` on plan_ready tool results — JSON.stringify drops undefined keys; a text-narrowing cast in plan_ready `renderResult`; a definedness guard around restored-mode normalization). devDependency `@earendil-works/pi-tui` pinned to `^0.85.1` to dedupe the nested copy that created two `TUI` type identities.
+
 ## [2.7.0] - 2026-09-12
 
 ### Changed

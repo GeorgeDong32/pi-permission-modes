@@ -22,6 +22,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
     "prepublishOnly": "node -e \"const pkg=require('./package.json'); if(!pkg.files||pkg.files.length===0){console.error('files field empty — abort');process.exit(1)}; console.log('Publishing '+pkg.name+'@'+pkg.version+' with files:', pkg.files)\"",
     "pack:dry": "npm pack --dry-run"
   },
@@ -44,6 +45,8 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@earendil-works/pi-tui": "^0.85.1",
+    "typescript": "^5.6.0",
     "vitest": "^1.6.0"
   }
 }

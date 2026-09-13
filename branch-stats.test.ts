@@ -11,6 +11,9 @@ type Entry = {
 	id?: string
 	message?: {
 		role: string
+		content?: unknown
+		toolName?: string
+		toolCallId?: string
 		usage?: {
 			input?: number
 			output?: number
@@ -19,6 +22,8 @@ type Entry = {
 			cost?: { total?: number }
 		}
 	}
+	customType?: string
+	data?: unknown
 }
 
 /** Reference implementation: brute-force sum in branch order. */

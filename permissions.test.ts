@@ -62,4 +62,20 @@ describe("permissions evaluate", () => {
 			),
 		).toBe("Bash(npm:*)")
 	})
+
+	// Characterization (plan2 C1): unknown tool names never match permission
+	// rules (no CC mapping → passthrough) even when broad rules exist. The B1
+	// embedded-command gate relies on this staying true.
+	it("unknown tool names are passthrough regardless of rules", () => {
+		const rules = rulesFromPermissionsConfig(
+			{ deny: ["Bash(rm *)"], allow: ["Edit(src/**)"] },
+			"global",
+		)
+		expect(
+			evaluateToolPermission("sol_fusion", { path: "src/a.ts" }, cwd, rules),
+		).toEqual({ behavior: "passthrough" })
+		expect(
+			evaluateToolPermission("mystery", {}, cwd, rules),
+		).toEqual({ behavior: "passthrough" })
+	})
 })

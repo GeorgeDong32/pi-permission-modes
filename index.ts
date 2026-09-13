@@ -1185,6 +1185,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         },
       ],
       terminate: true as const,
+      details: undefined,
     };
   }
 
@@ -1214,6 +1215,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       if (currentMode !== "plan") {
         return {
           content: [{ type: "text", text: "plan_ready is only available in plan mode. Current mode: " + currentMode }],
+          details: undefined,
         };
       }
       const planContent = readPlanFile(ctx.cwd);
@@ -1223,6 +1225,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       if (!extracted.length) {
         return {
           content: [{ type: "text", text: "No plan steps found in plan.md. Write a numbered plan first, then call plan_ready." }],
+          details: undefined,
         };
       }
 
@@ -1238,6 +1241,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         const summaryLine = summary ? `${summary}\n\n` : "";
         return {
           content: [{ type: "text", text: `Plan submitted (headless auto-execute).\n${summaryLine}${stepsPreview}` }],
+          details: undefined,
         };
       }
 
@@ -1270,6 +1274,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         return {
           content: [{ type: "text", text: "Plan approved by user. Switching to execution mode." }],
           terminate: true,
+          details: undefined,
         };
       }
 
@@ -1288,7 +1293,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       );
     },
     renderResult(result, _options, theme) {
-      const first = result.content?.find((c: any) => c.type === "text");
+      const first = result.content?.find((c: any) => c.type === "text") as
+        | { text?: string }
+        | undefined;
       return new Text(theme.fg("muted", truncateToWidth(String(first?.text ?? ""), 80)), 0, 0);
     },
   }));
@@ -2134,10 +2141,12 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         | undefined;
       if (last) {
         let m = last.currentMode;
-        if (m === "normal") m = "default";      // legacy (v0.x)
-        if (m === "default") m = "ask";          // v1.0.0 → v2.0.0 rename
-        if (m === "accept-edits") m = "ask";
-        if ((MODE_CYCLE as string[]).includes(m)) currentMode = m!;
+        if (m) {
+          if (m === "normal") m = "default";      // legacy (v0.x)
+          if (m === "default") m = "ask";          // v1.0.0 → v2.0.0 rename
+          if (m === "accept-edits") m = "ask";
+          if ((MODE_CYCLE as string[]).includes(m)) currentMode = m as PermissionMode;
+        }
         if (typeof last.planPhase === "string")
           planPhase = last.planPhase as PlanPhase;
         if (typeof last.planExecuting === "boolean")
