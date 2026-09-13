@@ -401,3 +401,40 @@ describe("permission-forwarding", () => {
 		expect(await listPendingRequests(agentDir, "parent-7")).toHaveLength(0);
 	});
 });
+
+
+// ---- mtime short-circuit (plan2 A1d) --------------------------------------
+
+describe("forwarding poller: mtime short-circuit", () => {
+	it("empty untouched dir ticks cost zero full scans; a new request bumps mtime and scans", async () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "pm-fwd-a1d-"));
+		const poller = createForwardingPoller({
+			agentDir,
+			getSessionId: () => "parent-a1d",
+			hasUI: true,
+			isChild: false,
+			onRequest: async () => {},
+			pollIntervalMs: 5,
+		});
+		poller.start();
+		// settle: first tick performs one full scan of the (empty) dir
+		await vi.waitFor(() => expect(poller.scanCount).toBe(1), { timeout: 1000, interval: 5 });
+		// untouched dir: many ticks, still one full scan (mtime short-circuit)
+		await new Promise((r) => setTimeout(r, 120));
+		expect(poller.scanCount).toBe(1);
+		// a request lands (atomic rename bumps dir mtime): next tick scans
+		const { id } = await writeForwardedRequest({
+			agentDir,
+			targetSessionId: "parent-a1d",
+			tool: "bash",
+			label: "x",
+			category: "user-prompt",
+			cwd: "/tmp",
+			input: {},
+		});
+		await vi.waitFor(() => expect(poller.scanCount).toBe(2), { timeout: 1000, interval: 5 });
+		expect(await listPendingRequests(agentDir, "parent-a1d")).toHaveLength(1);
+		void id;
+		poller.stop();
+	});
+});

@@ -14,6 +14,7 @@ import {
 	existsSync,
 	mkdirSync,
 	readdirSync,
+	statSync,
 	readFileSync,
 	renameSync,
 	unlinkSync,
@@ -307,6 +308,8 @@ export interface ForwardingPollerOptions {
 export interface ForwardingPoller {
 	start(): void;
 	stop(): void;
+	/** plan2 A1d test surface: full scans performed (mtime short-circuits excluded). */
+	readonly scanCount: number;
 }
 
 export function createForwardingPoller(
@@ -314,6 +317,8 @@ export function createForwardingPoller(
 ): ForwardingPoller {
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let processing = false;
+	let lastDirStat: { mtimeMs: number; hadPending: boolean } | undefined;
+	let scans = 0;
 	const claimed = opts.claimedIds ?? new Set<string>();
 	const pollIntervalMs =
 		opts.pollIntervalMs ?? PERMISSION_FORWARDING_POLL_INTERVAL_MS;
@@ -324,6 +329,22 @@ export function createForwardingPoller(
 		if (!sessionId) return;
 		processing = true;
 		try {
+			// plan2 A1d: mtime short-circuit — skip the readdir + per-file
+			// reads while the requests dir is untouched since the last scan
+			// that found nothing pending. New requests land via atomic rename,
+			// which bumps the dir mtime; handled requests unlink, likewise.
+			const dir = requestsDir(opts.agentDir, sessionId);
+			if (lastDirStat && !lastDirStat.hadPending) {
+				try {
+					if (statSync(dir).mtimeMs === lastDirStat.mtimeMs) return;
+				} catch {
+					// requests dirs are created lazily: "still absent" is a
+					// stable state worth short-circuiting too (mtimeMs < 0).
+					if (lastDirStat.mtimeMs < 0) return;
+					lastDirStat = undefined;
+				}
+			}
+			scans++;
 			const pending = await listPendingRequests(opts.agentDir, sessionId);
 			for (const req of pending) {
 				if (claimed.has(req.id)) continue;
@@ -336,6 +357,14 @@ export function createForwardingPoller(
 					throw new Error("forwarding onRequest failed");
 				}
 			}
+			try {
+				lastDirStat = {
+					mtimeMs: statSync(dir).mtimeMs,
+					hadPending: pending.length > 0,
+				};
+			} catch {
+				lastDirStat = { mtimeMs: -1, hadPending: false };
+			}
 		} catch {
 			/* swallow — next tick retries */
 		} finally {
@@ -343,7 +372,10 @@ export function createForwardingPoller(
 		}
 	}
 
-	return {
+	const poller: ForwardingPoller = {
+		get scanCount() {
+			return scans;
+		},
 		start() {
 			if (opts.isChild || !opts.hasUI) return;
 			if (timer) return;
@@ -361,4 +393,5 @@ export function createForwardingPoller(
 			}
 		},
 	};
+	return poller;
 }
