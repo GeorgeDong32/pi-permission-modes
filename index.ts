@@ -59,6 +59,10 @@ import {
   readSessionId,
 } from "./session-branch.ts";
 import {
+  declaredCommandFields,
+  extractEmbeddedCommandInputs,
+} from "./fusion-tools.ts";
+import {
   accumulateBranchStats,
   emptyBranchStatsState,
 } from "./branch-stats.ts";
@@ -485,8 +489,13 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       return { allow: false, reason: risk.reason, category: risk.category };
     }
 
+    // powershell runs the bash tier ladder under bash semantics (conservative
+    // approximation for PowerShell verbs — plan2 B1).
     const isKnownTier3 =
-      tool === "bash" || tool === "edit" || tool === "write";
+      tool === "bash" ||
+      tool === "powershell" ||
+      tool === "edit" ||
+      tool === "write";
     if (!isKnownTier3) {
       return {
         allow: false,
@@ -494,12 +503,12 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         category: "unknown-tool",
       };
     }
-    if (tool === "bash") {
+    if (tool === "bash" || tool === "powershell") {
       const cmd = String(input.command ?? "");
       if (cmd && !isAutoFallbackBash(cmd)) {
         return {
           allow: false,
-          reason: `Mutating bash in auto mode: ${cmd}`,
+          reason: `Mutating ${tool} in auto mode: ${cmd}`,
           category: "mutating-bash",
         };
       }
@@ -629,7 +638,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     input: Record<string, unknown>,
     cwd: string,
   ): string {
-    if (tool === "bash") {
+    if (tool === "bash" || tool === "powershell") {
       const cmd = String(input.command ?? "");
       if (cmd && !isSafeCommand(cmd)) {
         return "Bash did not pass read-only allowlist; may include writes, installs, or unknown binaries.";
@@ -643,7 +652,16 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       }
       return "File write/edit requires tier-3 review.";
     }
-    return `Tool "${tool}" is not auto-approved without classifier.`;
+    const embedded = extractEmbeddedCommandInputs(tool, input);
+    if (embedded.length === 0) {
+      return `Tool "${tool}" is not auto-approved without classifier.`;
+    }
+    return (
+      `Tool "${tool}" is not auto-approved without classifier.\n` +
+      `  fusion tool carries command not individually approved: ${embedded
+        .map((c) => c.command)
+        .join(" && ")}${fusionSchemaHint(tool)}`
+    );
   }
 
   function collectClassifierSessionContext(
@@ -1626,6 +1644,34 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     return undefined;
   }
 
+  // plan2 B1 ②: one-shot annotation from session_start — tool schemas that
+  // declare command-shaped fields (fusion-capable tools). Label-only source
+  // hint; no behavior branches on this data.
+  let fusionToolSchemaFields = new Map<string, string[]>();
+
+  function fusionSchemaHint(toolName: string): string {
+    const fields = fusionToolSchemaFields.get(toolName);
+    return fields?.length
+      ? `\n  (tool schema declares command fields: ${fields.join(", ")})`
+      : "";
+  }
+
+  function scanFusionToolSchemas(): void {
+    const found = new Map<string, string[]>();
+    try {
+      for (const info of pi.getAllTools?.() ?? []) {
+        if (!info?.name) continue;
+        // bash/powershell's own `command` IS the primary input, not embedded.
+        if (info.name === "bash" || info.name === "powershell") continue;
+        const fields = declaredCommandFields(info.parameters);
+        if (fields.length > 0) found.set(info.name, fields);
+      }
+      fusionToolSchemaFields = found;
+    } catch {
+      fusionToolSchemaFields = new Map();
+    }
+  }
+
   // ---- tool_call gate ----------------------------------------------------
   pi.on("tool_call", async (event, ctx): Promise<Block> => {
     const tool = event.toolName;
@@ -1660,6 +1706,66 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
       return permResult;
     }
 
+    // plan2 B1: embedded-command gate. Fusion tools (e.g. SoL-Pi Action
+    // Fusion) carry shell commands in non-primary input fields; those never
+    // reach the bash dispatch, so vet them here — BEFORE mode dispatch, by
+    // FIELD SCAN, not by tool name (overrides may reuse built-in names).
+    // Lazy by construction: field-less inputs (unknown tools included) are
+    // untouched; the shell tools' own primary `command` is excluded because
+    // the full ladder below already governs it.
+    const embeddedCommands = extractEmbeddedCommandInputs(tool, input);
+    if (embeddedCommands.length > 0) {
+      const hint = fusionSchemaHint(tool);
+      if (currentMode === "plan") {
+        const offender = embeddedCommands.find(
+          (c) => !classifyBashTiers(c.command).safe,
+        );
+        if (offender) {
+          return {
+            block: true,
+            reason: `Plan mode: read-only commands only.\n  Command: ${offender.command}${hint}`,
+          };
+        }
+        // all tier-1 — plan dispatch below still applies
+      } else if (currentMode === "auto") {
+        for (const { command } of embeddedCommands) {
+          if (commandReferencesSensitivePath(command)) {
+            return promptAutoTier3(
+              ctx,
+              tool,
+              input,
+              `sensitive path in command: ${command}${hint}`,
+              "sensitive-path",
+            );
+          }
+          const tiers = classifyBashTiers(command);
+          if (!tiers.safe && !tiers.autoApprovable) {
+            return promptAutoTier3(
+              ctx,
+              tool,
+              input,
+              describeTier3Review(tool, input, ctx.cwd),
+              "fusion-command",
+            );
+          }
+        }
+        // every embedded command individually tier-1/2 — normal auto dispatch
+        // still runs (path checks for edit/write; unknown names keep their
+        // tier-3 review)
+      } else if (currentMode === "ask") {
+        const offender = embeddedCommands.find((c) => !isSafeCommand(c.command));
+        if (offender) {
+          return promptApproval(
+            ctx,
+            tool,
+            `${embeddedCommands.map((c) => `"${c.command}"`).join(", ")}${hint}`,
+            input,
+          );
+        }
+        // all read-only-safe — fall through, like safe bash in ask
+      }
+    }
+
     // PLAN EXECUTION: use auto-mode tiered gate (classifier + blacklist).
     // planExecuting only affects prompt injection and UI; it does not bypass auto.
 
@@ -1678,7 +1784,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
           reason: `Plan mode: only ${shortenPath(planFilePath)} may be edited.`,
         };
       }
-      if (tool === "bash") {
+      if (tool === "bash" || tool === "powershell") {
         const cmd = String(input.command ?? "");
         if (!isSafeCommand(cmd)) {
           return {
@@ -1722,7 +1828,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
         }
       }
 
-      if (tool === "bash") {
+      if (tool === "bash" || tool === "powershell") {
         const cmd = String(input.command ?? "");
         if (cmd && commandReferencesSensitivePath(cmd)) {
           return promptAutoTier3(
@@ -1764,7 +1870,10 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
 
       return approveAutoTier3(ctx, tool, input, {
         tool,
-        command: tool === "bash" ? String(input.command ?? "") : undefined,
+        command:
+          tool === "bash" || tool === "powershell"
+            ? String(input.command ?? "")
+            : undefined,
         path:
           tool === "edit" || tool === "write"
             ? String(input.path ?? "")
@@ -1815,7 +1924,7 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
           blockReason: `${tool} blocked by user on ${pathVal}`,
         });
       }
-      if (tool === "bash") {
+      if (tool === "bash" || tool === "powershell") {
         const cmd = String(input.command ?? "");
         if (isSafeCommand(cmd)) return undefined;
         return promptApproval(ctx, tool, `"${cmd}"`, input);
@@ -2097,6 +2206,9 @@ export default function permissionModesExtension(pi: ExtensionAPI): void {
     _event: unknown,
     ctx: ExtensionContext,
   ): Promise<void> {
+    // plan2 B1 ②: enumerate tool schemas once per session (reload re-runs).
+    scanFusionToolSchemas();
+
     // Ensure the model profiles config exists (creates ~/.pi/agent if missing
     // and writes a default file with the user's default model detected from
     // settings.json). Re-runs on /reload so a user-deleted file is recreated.

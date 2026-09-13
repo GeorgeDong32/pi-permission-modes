@@ -41,6 +41,7 @@ export interface PermissionsConfig {
 
 const PI_TO_CC_TOOL: Record<string, string> = {
 	bash: "Bash",
+	powershell: "Bash",
 	read: "Read",
 	grep: "Read",
 	find: "Read",

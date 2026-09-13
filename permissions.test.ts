@@ -78,4 +78,18 @@ describe("permissions evaluate", () => {
 			evaluateToolPermission("mystery", {}, cwd, rules),
 		).toEqual({ behavior: "passthrough" })
 	})
+
+	// plan2 B1: powershell maps onto Bash rules (pi 0.85.1 built-in shell).
+	it("powershell evaluates under Bash permission rules", () => {
+		const rules = rulesFromPermissionsConfig(
+			{ deny: ["Bash(rm *)"], allow: ["Bash(npm *)"] },
+			"global",
+		)
+		expect(
+			evaluateToolPermission("powershell", { command: "rm -rf x" }, cwd, rules).behavior,
+		).toBe("deny")
+		expect(
+			evaluateToolPermission("powershell", { command: "npm test" }, cwd, rules).behavior,
+		).toBe("allow")
+	})
 })

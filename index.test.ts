@@ -543,6 +543,189 @@ describe("permission-modes extension: tool_call gate", () => {
 		})
 	})
 
+	// plan2 B1: embedded-command gate for fusion tools. Tools carrying shell
+	// commands in non-primary fields (SoL-Pi Action Fusion `then_run`) now get
+	// those commands vetted by the same ladder as bash. Field-less unknown
+	// tools keep their pinned passthrough behavior (describe above).
+	describe("B1: embedded command gate", () => {
+		it("ask prompts with the embedded command listed (was silent allow)", async () => {
+			await switchMode("ask")
+			const selectCalls: string[] = []
+			const result = await callToolCall("sol_edit", { path: "a.ts", then_run: "npm install left-pad" }, {
+				select: async (label: string) => {
+					selectCalls.push(label)
+					return "Block"
+				},
+			})
+			expect(result).toMatchObject({ block: true })
+			expect(selectCalls[0]).toContain('"npm install left-pad"')
+		})
+
+		it("ask stays silent when every embedded command is read-only-safe", async () => {
+			await switchMode("ask")
+			const result = await callToolCall("sol_edit", { path: "a.ts", then_run: "ls -la" })
+			expect(result).toBeUndefined()
+		})
+
+		it("plan blocks non-tier-1 embedded commands with the plan-bash text", async () => {
+			await switchMode("plan")
+			const result = await callToolCall("sol_edit", { path: "a.ts", then_run: "npm install x" })
+			expect(result).toMatchObject({
+				block: true,
+				reason: expect.stringContaining("Plan mode: read-only commands only."),
+			})
+			expect((result as { reason: string }).reason).toContain("npm install x")
+		})
+
+		it("plan allows tier-1 embedded commands", async () => {
+			await switchMode("plan")
+			const result = await callToolCall("sol_edit", { path: "a.ts", then_run: "ls -la" })
+			expect(result).toBeUndefined()
+		})
+
+		it("auto prompts tier-3 embedded commands with the fusion review label", async () => {
+			await switchMode("auto")
+			const selectCalls: string[] = []
+			const result = await callToolCall("sol_edit", { path: "a.ts", then_run: "rm -rf /tmp/panel-b1" }, {
+				select: async (label: string) => {
+					selectCalls.push(label)
+					return "Block"
+				},
+			})
+			expect(result).toMatchObject({ block: true })
+			expect(selectCalls[0]).toContain("fusion tool carries command not individually approved")
+			expect(selectCalls[0]).toContain("rm -rf /tmp/panel-b1")
+		})
+
+		it("auto tier-2 embedded commands fall through: unknown tool keeps tier-3 review", async () => {
+			await switchMode("auto")
+			const selectCalls: string[] = []
+			const result = await callToolCall("sol_edit", { path: "a.ts", then_run: "npm test" }, {
+				select: async (label: string) => {
+					selectCalls.push(label)
+					return "Block"
+				},
+			})
+			// Gate passed the command individually; the unknown TOOL name still
+			// gets its (pre-existing, pinned) auto-mode tier-3 prompt.
+			expect(result).toMatchObject({ block: true })
+			expect(selectCalls[0]).toContain("not auto-approved in auto mode")
+		})
+
+		it("auto tier-2 embedded command on an edit override allows in cwd (path checks still run)", async () => {
+			await switchMode("auto")
+			const result = await callToolCall("edit", { path: "src/foo.ts", then_run: "npm test" })
+			expect(result).toBeUndefined()
+		})
+
+		it("override same-name: edit with destructive then_run prompts in ask and blocks in plan", async () => {
+			await switchMode("ask")
+			const asked = await callToolCall("edit", { path: "src/a.ts", then_run: "rm -rf /tmp/panel-b1-ovr" }, {
+				select: async () => "Block",
+			})
+			expect(asked).toMatchObject({ block: true })
+			await switchMode("plan")
+			const blocked = await callToolCall("edit", { path: "plan.md", then_run: "rm -rf /tmp/panel-b1-ovr" })
+			expect(blocked).toMatchObject({ block: true })
+		})
+
+		it("bypass still allows embedded commands", async () => {
+			await switchMode("bypass")
+			const result = await callToolCall("sol_edit", { path: "a.ts", then_run: "rm -rf /tmp/panel-b1-bp" })
+			expect(result).toBeUndefined()
+		})
+	})
+
+	// plan2 B1: powershell (pi 0.85.1 built-in) runs the bash ladder under
+	// bash-semantics approximation — same gates, conservative direction.
+	describe("B1: powershell mapping", () => {
+		it("plan blocks destructive powershell like bash", async () => {
+			await switchMode("plan")
+			const result = await callToolCall("powershell", { command: "rm -rf /tmp/panel-b1-ps" })
+			expect(result).toMatchObject({ block: true })
+		})
+
+		it("plan allows safe powershell commands", async () => {
+			await switchMode("plan")
+			expect(await callToolCall("powershell", { command: "ls" })).toBeUndefined()
+		})
+
+		it("ask prompts on mutating powershell, stays silent on safe", async () => {
+			await switchMode("ask")
+			const selectCalls: string[] = []
+			const result = await callToolCall("powershell", { command: "npm install x" }, {
+				select: async (label: string) => {
+					selectCalls.push(label)
+					return "Block"
+				},
+			})
+			expect(result).toMatchObject({ block: true })
+			expect(selectCalls[0]).toContain("npm install x")
+			expect(await callToolCall("powershell", { command: "ls" })).toBeUndefined()
+		})
+
+		it("auto allows tier-1 powershell and prompts tier-3", async () => {
+			await switchMode("auto")
+			expect(await callToolCall("powershell", { command: "ls -la" })).toBeUndefined()
+			const result = await callToolCall("powershell", { command: "rm -rf /tmp/panel-b1-ps3" }, {
+				select: async () => "Block",
+			})
+			expect(result).toMatchObject({ block: true })
+		})
+
+		it("powershell primary command is never double-gated (single prompt)", async () => {
+			await switchMode("auto")
+			const selectCalls: string[] = []
+			await callToolCall("powershell", { command: "npm install x" }, {
+				select: async (label: string) => {
+					selectCalls.push(label)
+					return "Block"
+				},
+			})
+			// exactly one approval prompt, labeled once (no embedded-command
+			// duplication of the primary command field)
+			expect(selectCalls.length).toBe(1)
+			expect(selectCalls[0]).not.toContain("fusion tool carries")
+		})
+	})
+
+	// plan2 B1 ②: label-only annotation from getAllTools schema enumeration.
+	describe("B1 ②: getAllTools schema annotation", () => {
+		it("approval labels append the schema hint for tools declaring command fields", async () => {
+			pi.allTools.push({
+				...fakeToolInfo("sol_edit"),
+				parameters: {
+					type: "object",
+					properties: { path: { type: "string" }, then_run: { type: "string" } },
+				} as ToolInfo["parameters"],
+			})
+			await pi.simulateSessionStart(realProjectRoot)
+			await switchMode("ask")
+			const selectCalls: string[] = []
+			const result = await callToolCall("sol_edit", { path: "a.ts", then_run: "npm install x" }, {
+				select: async (label: string) => {
+					selectCalls.push(label)
+					return "Block"
+				},
+			})
+			expect(result).toMatchObject({ block: true })
+			expect(selectCalls[0]).toContain("(tool schema declares command fields: then_run)")
+		})
+
+		it("tools without declared command fields get no hint", async () => {
+			await pi.simulateSessionStart(realProjectRoot)
+			await switchMode("ask")
+			const selectCalls: string[] = []
+			await callToolCall("mystery_tool", { run: "npm install x" }, {
+				select: async (label: string) => {
+					selectCalls.push(label)
+					return "Block"
+				},
+			})
+			expect(selectCalls[0]).not.toContain("tool schema declares")
+		})
+	})
+
 	describe("plan_ready tool", () => {
 		let tmpCwd: string
 
