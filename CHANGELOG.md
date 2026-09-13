@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.8.0] - 2026-09-13
 
 ### Changed
 - **Classifier migrated off the deprecated `pi-ai/compat` entrypoint (plan2 B2)**: completion now goes through the host `ctx.modelRegistry.complete()`. Auth resolution — including the provider `baseUrl` merge that the old hand-rolled `ResolvedAuth` dropped, silently mis-routing custom baseUrl providers — happens inside `ModelRuntime.prepareRequest` (verified against pi-core source). The static `completeSimple` import (whose parent module is slated for deletion and would have broken extension loading outright) is gone: `grep pi-ai/compat` over production files returns nothing. `ResolvedAuth` now aliases the real host shape, and the `ctx.modelRegistry as any` cast at the call site is deleted. Retry is single-layer with a documented bound: the classifier call passes `maxRetries: 0` (SDK client retries previously defaulted to 2 and stacked invisibly) plus `timeoutMs`, so the worst-case wait is `timeoutMs × MAX_CLASSIFIER_FAILURES` — pinned by a timing test (exactly 3 attempts, bounded total). Tests: the whole-module compat mock is replaced by an injected fake `registry.complete`; a real un-mocked faux-provider smoke runs the full context/options path through pi-ai; a baseUrl case proves the client passes the model through unmodified (the merge belongs to the registry). devDependency `@earendil-works/pi-ai` pinned to `^0.85.1` (was a stale hoisted 0.80.2 that forked type identities).
